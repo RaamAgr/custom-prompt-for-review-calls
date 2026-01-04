@@ -1,7 +1,7 @@
-# app.py — FIXED FINAL
+# app.py — FINAL VERSION (STRUCTURALLY SEPARATED)
 # -----------------------------------------------------------------------------
-# 1. PROMPT EDITOR: Guaranteed on MAIN PAGE (Dedented correctly).
-# 2. SIDEBAR: Strictly for API Key & Settings.
+# 1. Sidebar and Main Page are separated into distinct functions.
+# 2. Prompt Editor is forcefully placed in the Main Content area.
 # -----------------------------------------------------------------------------
 
 import streamlit as st
@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Dict, Any
 
-# --- 1. PAGE CONFIG (Global) ---
+# --- 1. PAGE CONFIG ---
 st.set_page_config(page_title="QA Auditor", layout="wide")
 
 # --- CONFIGURATION ---
@@ -51,11 +51,22 @@ BASE_CSS = """
     margin-bottom: 10px;
     box-shadow: 0 1px 3px rgba(0,0,0,0.05);
 }
-.metric-title { font-size: 0.85em; font-weight: 700; color: #666; text-transform: uppercase; margin-bottom: 5px; }
-.metric-value { font-size: 2.0em; font-weight: 800; margin: 0; line-height: 1.2; }
-.metric-sub { font-size: 0.8em; color: #888; margin-top: 4px; }
-.dark-theme { --card-bg: #1e2126; --border-color: #333; color: #e6eef3; }
-.light-theme { --card-bg: #ffffff; --border-color: #e6e6e6; color: #111; }
+.metric-title { 
+    font-size: 0.85em; font-weight: 700; color: var(--meta-color, #666); 
+    text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 5px;
+}
+.metric-value { 
+    font-size: 2.0em; font-weight: 800; margin: 0; line-height: 1.2;
+}
+.metric-sub { 
+    font-size: 0.8em; color: var(--meta-color, #888); margin-top: 4px;
+}
+.dark-theme {
+    --card-bg: #1e2126; --border-color: #333; --meta-color: #9aa0a6; color: #e6eef3;
+}
+.light-theme {
+    --card-bg: #ffffff; --border-color: #e6e6e6; --meta-color: #666666; color: #111;
+}
 .streamlit-expanderHeader { font-weight: 600; }
 </style>
 """
@@ -63,6 +74,7 @@ st.markdown(BASE_CSS, unsafe_allow_html=True)
 
 
 # --- UTILITIES ---
+
 def _sleep_with_jitter(base_seconds: float, attempt: int):
     jitter = random.uniform(0.5, 1.5)
     to_sleep = min(base_seconds * (2 ** attempt) * jitter, 30)
@@ -287,13 +299,10 @@ OUTPUT FORMAT (STRICT JSON):
 }
 """
 
-# --- MAIN APP ---
+# --- RENDERING FUNCTIONS (SEPARATED) ---
 
-def main():
-    if "processed_results" not in st.session_state: st.session_state.processed_results = []
-    if "final_df" not in st.session_state: st.session_state.final_df = pd.DataFrame()
-
-    # --- SIDEBAR START ---
+def render_sidebar():
+    """Renders ONLY sidebar elements"""
     with st.sidebar:
         st.header("⚙️ Settings")
         api_key = st.text_input("Gemini API Key", type="password")
@@ -303,16 +312,13 @@ def main():
         language_mode = st.selectbox("Language Context", ["English", "Hindi", "Hinglish"], index=2)
         st.divider()
         theme_choice = st.radio("UI Theme", ["Light", "Dark"], 0, horizontal=True)
-    # --- SIDEBAR END ---
+    return api_key, max_workers, keep_remote, language_mode, theme_choice
 
-    # Theme Injection (Main Page)
-    theme_class = "dark-theme" if theme_choice == "Dark" else "light-theme"
-    st.markdown(f"<div class='{theme_class}'>", unsafe_allow_html=True)
-
-    # --- MAIN PAGE CONTENT ---
+def render_main_content(api_key, max_workers, keep_remote, language_mode):
+    """Renders MAIN PAGE elements (Prompt Editor, Upload, Results)"""
     st.title("🤖 QA Call Auditor")
-
-    # [FIX] This is clearly OUTSIDE the sidebar block
+    
+    # PROMPT EDITOR (Guaranteed Main Page)
     st.markdown("### 📝 Edit System Prompt")
     st.caption("Define your strict JSON structure here.")
     prompt_input = st.text_area(
@@ -354,7 +360,7 @@ def main():
         st.session_state.final_df = pd.DataFrame(st.session_state.processed_results)
         status_text.success("Batch Processing Complete!")
 
-    # Results
+    # RESULTS VIEWER
     df = st.session_state.final_df
     if not df.empty:
         st.markdown("---")
@@ -388,6 +394,22 @@ def main():
                 else:
                     st.warning("⚠️ Could not parse JSON. Showing raw text below:")
                     st.code(raw_txt)
+
+# --- MAIN ENTRY POINT ---
+
+def main():
+    if "processed_results" not in st.session_state: st.session_state.processed_results = []
+    if "final_df" not in st.session_state: st.session_state.final_df = pd.DataFrame()
+
+    # 1. RENDER SIDEBAR
+    api_key, max_workers, keep_remote, language_mode, theme_choice = render_sidebar()
+
+    # 2. INJECT THEME
+    theme_class = "dark-theme" if theme_choice == "Dark" else "light-theme"
+    st.markdown(f"<div class='{theme_class}'>", unsafe_allow_html=True)
+
+    # 3. RENDER MAIN PAGE
+    render_main_content(api_key, max_workers, keep_remote, language_mode)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
