@@ -1,4 +1,4 @@
-# app.py — COMPLETE BATCH TRANSCRIBER (ALL ROWS + MAIN SCREEN PROMPT)
+# app.py — COMPLETE BATCH TRANSCRIBER (ALL ROWS + EDITABLE PROMPT)
 # -----------------------------------------------------------------------------
 # FEATURES INCLUDED:
 # 1. Multi-file Excel Upload (Merges multiple files).
@@ -7,7 +7,7 @@
 # 4. Empty Response Retry (Retries Gemini API if it returns empty text).
 # 5. High Concurrency (Slider up to 128 workers).
 # 6. Job-Level Retry (Retries the full sequence on transient failure).
-# 7. UI FIX: System Prompt Editor is located in the MAIN BODY, not Sidebar.
+# 7. NEW: Editable System Prompt in UI.
 # -----------------------------------------------------------------------------
 
 import streamlit as st
@@ -135,7 +135,7 @@ def make_request_with_retry(method: str, url: str, max_retries: int = 5, backoff
             logger.warning("RequestException on %s %s: %s (attempt %d)", method, url, str(e), attempt + 1)
             last_exc = e
             _sleep_with_jitter(backoff_base, attempt)
-       
+      
     # All retries exhausted
     if last_exc:
         raise last_exc
@@ -610,18 +610,16 @@ Return ONLY the transcript. No explanation.
 # --- MAIN APPLICATION ENTRY POINT ---
 
 def main():
-    # --- 1. SESSION STATE INIT ---
+    # Initialize Session State
     if "processed_results" not in st.session_state:
         st.session_state.processed_results = []
     if "final_df" not in st.session_state:
         st.session_state.final_df = pd.DataFrame()
 
-    # --- 2. SIDEBAR (SETTINGS ONLY) ---
+    # --- SIDEBAR CONFIG ---
     with st.sidebar:
-        st.header("⚙️ Configuration")
-        api_key = st.text_input("Gemini API Key", type="password", help="Get this from Google AI Studio")
-        
-        st.divider()
+        st.header("Configuration")
+        api_key = st.text_input("Gemini API Key", type="password")
         
         # Concurrency slider
         max_workers = st.slider("Concurrency (Threads)", min_value=1, max_value=128, value=4,
@@ -631,59 +629,45 @@ def main():
                                 help="For debugging: prevents auto-deletion of files from Gemini.")
         
         st.divider()
-        theme_choice = st.radio("Theme", options=["Light", "Dark"], index=0, horizontal=True)
-        st.caption("Dark theme is recommended for high contrast.")
-
-    # Apply Theme Class
-    theme_class = "dark-theme" if theme_choice == "Dark" else "light-theme"
-    st.markdown(f"<div class='{theme_class}'>", unsafe_allow_html=True)
-
-    # --- 3. MAIN INTERFACE ---
-    st.title("🎙️ Batch Transcriber")
-    st.markdown(f"Using Model: **{MODEL_NAME}**")
-
-    # A. File Uploader
-    st.write("### 📂 1. Upload Data")
-    uploaded_files = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"], accept_multiple_files=True)
-
-    # B. Transcription Configuration (Main Screen)
-    st.write("### 🧠 2. Transcription Logic")
-    
-    # Create two columns for better layout
-    col_settings, col_prompt = st.columns([1, 2])
-
-    with col_settings:
-        st.info("Language Settings")
-        language_mode = st.selectbox("Target Language", ["English (India)", "Hindi", "Mixed (Hinglish)"], index=2)
+        
+        language_mode = st.selectbox("Language", ["English (India)", "Hindi", "Mixed (Hinglish)"], index=2)
         lang_map = {
             "English (India)": "English (Indian accent)",
             "Hindi": "Hindi (Devanagari)",
             "Mixed (Hinglish)": "Mixed English and Hindi"
         }
-        st.caption(f"**Selected:** {lang_map[language_mode]}")
-        st.caption("The prompt on the right will automatically use this language setting.")
-
-    with col_prompt:
-        # We use an expander that is OPEN by default so it's visible but collapsible
-        with st.expander("📝 Edit System Prompt (Instructions for AI)", expanded=True):
+        
+        # --- EDITABLE PROMPT SECTION ---
+        with st.expander("⚙️ Advanced: Edit System Prompt"):
+            st.caption("Instructions sent to Gemini. {language} will be replaced by your selection above.")
             prompt_input = st.text_area(
                 "System Prompt", 
                 value=DEFAULT_PROMPT_TEMPLATE, 
-                height=300,
-                help="These are the instructions sent to the model. {language} will be replaced dynamically."
+                height=300
             )
 
-    st.markdown("---")
+        st.divider()
+        theme_choice = st.radio("Theme", options=["Light", "Dark"], index=0, horizontal=True)
+        st.caption("Use Dark theme if you prefer low-light UI.")
+
+    # Apply Theme Class
+    theme_class = "dark-theme" if theme_choice == "Dark" else "light-theme"
+    st.markdown(f"<div class='{theme_class}'>", unsafe_allow_html=True)
+
+
+    # --- FILE UPLOADER (MULTI-FILE) ---
+    st.write("### 📂 Upload Call Data")
+    uploaded_files = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"], accept_multiple_files=True)
 
     # Status Containers
     progress_bar = st.empty()
     status_text = st.empty()
     result_placeholder = st.empty()
 
-    # C. Action Button
-    start_button = st.button("🚀 Start Batch Processing (All Rows)", type="primary", use_container_width=True)
+    start_button = st.button("🚀 Start Batch Processing (All Rows)", type="primary")
 
-    # --- 4. PROCESSING LOGIC ---
+
+    # --- PROCESSING LOGIC ---
     if start_button:
         # Validation
         if not api_key:
@@ -709,6 +693,7 @@ def main():
             st.stop()
 
         # Combine into one Master DataFrame
+        # ignore_index=True ensures a clean 0..N index
         raw_df = pd.concat(all_dfs, ignore_index=True)
 
         # Check for required columns
@@ -721,6 +706,7 @@ def main():
         # 2. PREPARE DATA (ALL ROWS)
         status_text.info("Preparing data for processing (Checking every row)...")
         
+        # This function marks every row for transcription or skipping based on URL presence
         df_processed_ready = prepare_all_rows(raw_df)
         
         # Prepare for Processing
@@ -772,7 +758,7 @@ def main():
         status_text.success("Batch Processing Complete!")
 
 
-    # --- 5. RESULTS VIEWER ---
+    # --- RESULTS VIEWER ---
     final_df = st.session_state.final_df
 
     if not final_df.empty:
