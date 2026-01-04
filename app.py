@@ -30,7 +30,7 @@ from typing import Optional, Dict, Any
 # --- CONFIGURATION ---
 BASE_URL = "https://generativelanguage.googleapis.com"
 UPLOAD_URL = "https://generativelanguage.googleapis.com/upload/v1beta/files"
-MODEL_NAME = "gemini-3-flash-preview" 
+MODEL_NAME = "gemini-2.5-flash" 
 
 # Streaming download chunk size (8KB)
 DOWNLOAD_CHUNK_SIZE = 8192
@@ -124,7 +124,7 @@ def make_request_with_retry(method: str, url: str, max_retries: int = 5, backoff
     last_exc = None
     for attempt in range(max_retries):
         try:
-            resp = requests.request(method, url, timeout=60, **kwargs)
+            resp = requests.request(method, url, timeout=120, **kwargs)
             # Treat 429 and 5xx as transient errors
             if resp.status_code == 429 or (500 <= resp.status_code < 600):
                 logger.warning("Transient HTTP %s from %s (attempt %d). Retrying...", resp.status_code, url, attempt + 1)
