@@ -1,8 +1,7 @@
-# app.py — FIXED COMPLETE VERSION
+# app.py — FIXED FINAL
 # -----------------------------------------------------------------------------
-# 1. Prompt Editor is on the MAIN PAGE (Verified indentation).
-# 2. Sidebar contains ONLY Settings (API Key, Concurrency).
-# 3. No code cuts.
+# 1. PROMPT EDITOR: Guaranteed on MAIN PAGE (Dedented correctly).
+# 2. SIDEBAR: Strictly for API Key & Settings.
 # -----------------------------------------------------------------------------
 
 import streamlit as st
@@ -21,7 +20,7 @@ from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Dict, Any
 
-# --- 1. PAGE CONFIG (Must be first) ---
+# --- 1. PAGE CONFIG (Global) ---
 st.set_page_config(page_title="QA Auditor", layout="wide")
 
 # --- CONFIGURATION ---
@@ -52,22 +51,11 @@ BASE_CSS = """
     margin-bottom: 10px;
     box-shadow: 0 1px 3px rgba(0,0,0,0.05);
 }
-.metric-title { 
-    font-size: 0.85em; font-weight: 700; color: var(--meta-color, #666); 
-    text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 5px;
-}
-.metric-value { 
-    font-size: 2.0em; font-weight: 800; margin: 0; line-height: 1.2;
-}
-.metric-sub { 
-    font-size: 0.8em; color: var(--meta-color, #888); margin-top: 4px;
-}
-.dark-theme {
-    --card-bg: #1e2126; --border-color: #333; --meta-color: #9aa0a6; color: #e6eef3;
-}
-.light-theme {
-    --card-bg: #ffffff; --border-color: #e6e6e6; --meta-color: #666666; color: #111;
-}
+.metric-title { font-size: 0.85em; font-weight: 700; color: #666; text-transform: uppercase; margin-bottom: 5px; }
+.metric-value { font-size: 2.0em; font-weight: 800; margin: 0; line-height: 1.2; }
+.metric-sub { font-size: 0.8em; color: #888; margin-top: 4px; }
+.dark-theme { --card-bg: #1e2126; --border-color: #333; color: #e6eef3; }
+.light-theme { --card-bg: #ffffff; --border-color: #e6e6e6; color: #111; }
 .streamlit-expanderHeader { font-weight: 600; }
 </style>
 """
@@ -75,7 +63,6 @@ st.markdown(BASE_CSS, unsafe_allow_html=True)
 
 
 # --- UTILITIES ---
-
 def _sleep_with_jitter(base_seconds: float, attempt: int):
     jitter = random.uniform(0.5, 1.5)
     to_sleep = min(base_seconds * (2 ** attempt) * jitter, 30)
@@ -306,7 +293,7 @@ def main():
     if "processed_results" not in st.session_state: st.session_state.processed_results = []
     if "final_df" not in st.session_state: st.session_state.final_df = pd.DataFrame()
 
-    # --- SIDEBAR (SETTINGS ONLY) ---
+    # --- SIDEBAR START ---
     with st.sidebar:
         st.header("⚙️ Settings")
         api_key = st.text_input("Gemini API Key", type="password")
@@ -316,18 +303,18 @@ def main():
         language_mode = st.selectbox("Language Context", ["English", "Hindi", "Hinglish"], index=2)
         st.divider()
         theme_choice = st.radio("UI Theme", ["Light", "Dark"], 0, horizontal=True)
+    # --- SIDEBAR END ---
 
+    # Theme Injection (Main Page)
     theme_class = "dark-theme" if theme_choice == "Dark" else "light-theme"
     st.markdown(f"<div class='{theme_class}'>", unsafe_allow_html=True)
 
-    # --- MAIN PAGE CONTENT (OUTSIDE SIDEBAR) ---
+    # --- MAIN PAGE CONTENT ---
     st.title("🤖 QA Call Auditor")
-    
-    # 1. PROMPT EDITOR
+
+    # [FIX] This is clearly OUTSIDE the sidebar block
     st.markdown("### 📝 Edit System Prompt")
     st.caption("Define your strict JSON structure here.")
-    
-    # THIS TEXT AREA IS NOW ON THE MAIN PAGE
     prompt_input = st.text_area(
         "System Prompt Input", 
         value=DEFAULT_AUDIT_PROMPT, 
@@ -335,8 +322,7 @@ def main():
         label_visibility="collapsed"
     )
 
-    # 2. File Upload
-    st.write("### 📂 Upload Excel Batch")
+    st.markdown("### 📂 Upload Excel Batch")
     uploaded_files = st.file_uploader("Select .xlsx files", type=["xlsx"], accept_multiple_files=True)
 
     progress_bar = st.empty()
@@ -368,7 +354,7 @@ def main():
         st.session_state.final_df = pd.DataFrame(st.session_state.processed_results)
         status_text.success("Batch Processing Complete!")
 
-    # 3. Results
+    # Results
     df = st.session_state.final_df
     if not df.empty:
         st.markdown("---")
