@@ -1,7 +1,7 @@
-# app.py — FINAL VERSION (STRUCTURALLY SEPARATED)
+# app.py — FINAL VERSION
 # -----------------------------------------------------------------------------
-# 1. Sidebar and Main Page are separated into distinct functions.
-# 2. Prompt Editor is forcefully placed in the Main Content area.
+# 1. Sidebar block explicitly closes before Prompt Editor starts.
+# 2. Prompt Editor is the FIRST element on the main page after the title.
 # -----------------------------------------------------------------------------
 
 import streamlit as st
@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Dict, Any
 
-# --- 1. PAGE CONFIG ---
+# --- 1. PAGE CONFIG (Must be first) ---
 st.set_page_config(page_title="QA Auditor", layout="wide")
 
 # --- CONFIGURATION ---
@@ -299,10 +299,15 @@ OUTPUT FORMAT (STRICT JSON):
 }
 """
 
-# --- RENDERING FUNCTIONS (SEPARATED) ---
+# --- MAIN APP ---
 
-def render_sidebar():
-    """Renders ONLY sidebar elements"""
+def main():
+    if "processed_results" not in st.session_state: st.session_state.processed_results = []
+    if "final_df" not in st.session_state: st.session_state.final_df = pd.DataFrame()
+
+    # ==========================================
+    # SIDEBAR SECTION (API KEYS & CONFIG ONLY)
+    # ==========================================
     with st.sidebar:
         st.header("⚙️ Settings")
         api_key = st.text_input("Gemini API Key", type="password")
@@ -312,22 +317,22 @@ def render_sidebar():
         language_mode = st.selectbox("Language Context", ["English", "Hindi", "Hinglish"], index=2)
         st.divider()
         theme_choice = st.radio("UI Theme", ["Light", "Dark"], 0, horizontal=True)
-    return api_key, max_workers, keep_remote, language_mode, theme_choice
+    
+    # Apply Theme
+    theme_class = "dark-theme" if theme_choice == "Dark" else "light-theme"
+    st.markdown(f"<div class='{theme_class}'>", unsafe_allow_html=True)
 
-def render_main_content(api_key, max_workers, keep_remote, language_mode):
-    """Renders MAIN PAGE elements (Prompt Editor, Upload, Results)"""
+    # ==========================================
+    # MAIN PAGE CONTENT (STARTS HERE)
+    # ==========================================
     st.title("🤖 QA Call Auditor")
     
-    # PROMPT EDITOR (Guaranteed Main Page)
+    # 1. PROMPT EDITOR (Placed explicitly on Main Page)
     st.markdown("### 📝 Edit System Prompt")
-    st.caption("Define your strict JSON structure here.")
-    prompt_input = st.text_area(
-        "System Prompt Input", 
-        value=DEFAULT_AUDIT_PROMPT, 
-        height=250, 
-        label_visibility="collapsed"
-    )
+    st.caption("Define your JSON structure here. The dashboard will adapt automatically.")
+    prompt_input = st.text_area("System Prompt Input", value=DEFAULT_AUDIT_PROMPT, height=250, label_visibility="collapsed")
 
+    # 2. File Upload
     st.markdown("### 📂 Upload Excel Batch")
     uploaded_files = st.file_uploader("Select .xlsx files", type=["xlsx"], accept_multiple_files=True)
 
@@ -360,7 +365,7 @@ def render_main_content(api_key, max_workers, keep_remote, language_mode):
         st.session_state.final_df = pd.DataFrame(st.session_state.processed_results)
         status_text.success("Batch Processing Complete!")
 
-    # RESULTS VIEWER
+    # 3. Results Viewer
     df = st.session_state.final_df
     if not df.empty:
         st.markdown("---")
@@ -394,22 +399,6 @@ def render_main_content(api_key, max_workers, keep_remote, language_mode):
                 else:
                     st.warning("⚠️ Could not parse JSON. Showing raw text below:")
                     st.code(raw_txt)
-
-# --- MAIN ENTRY POINT ---
-
-def main():
-    if "processed_results" not in st.session_state: st.session_state.processed_results = []
-    if "final_df" not in st.session_state: st.session_state.final_df = pd.DataFrame()
-
-    # 1. RENDER SIDEBAR
-    api_key, max_workers, keep_remote, language_mode, theme_choice = render_sidebar()
-
-    # 2. INJECT THEME
-    theme_class = "dark-theme" if theme_choice == "Dark" else "light-theme"
-    st.markdown(f"<div class='{theme_class}'>", unsafe_allow_html=True)
-
-    # 3. RENDER MAIN PAGE
-    render_main_content(api_key, max_workers, keep_remote, language_mode)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
