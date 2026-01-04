@@ -1,8 +1,10 @@
-# app.py — FINAL CORRECTED VERSION
+# app.py — FINAL FIXED VERSION
 # -----------------------------------------------------------------------------
-# FIXES:
-# 1. Removed duplicate 'st.set_page_config' (which caused the app to crash/not update).
-# 2. PROMPT EDITOR IS EXPLICITLY ON THE MAIN PAGE (Not Sidebar).
+# FEATURES:
+# 1. PROMPT EDITOR ON MAIN PAGE (Verified).
+# 2. QA Dashboard (Visual metrics).
+# 3. Aggressive JSON Parsing.
+# 4. Full Concurrency & Retries.
 # -----------------------------------------------------------------------------
 
 import streamlit as st
@@ -21,7 +23,7 @@ from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Dict, Any
 
-# --- 1. PAGE CONFIG (Must be the very first Streamlit command) ---
+# --- 1. PAGE CONFIG ---
 st.set_page_config(page_title="QA Auditor", layout="wide")
 
 # --- CONFIGURATION ---
@@ -43,7 +45,6 @@ logger = logging.getLogger("transcriber")
 # --- UI STYLING ---
 BASE_CSS = """
 <style>
-/* Metric Card Style */
 .metric-box {
     background-color: var(--card-bg, #f8f9fa);
     border: 1px solid var(--border-color, #eee);
@@ -63,8 +64,6 @@ BASE_CSS = """
 .metric-sub { 
     font-size: 0.8em; color: var(--meta-color, #888); margin-top: 4px;
 }
-
-/* Themes */
 .dark-theme {
     --card-bg: #1e2126; --border-color: #333; --meta-color: #9aa0a6; color: #e6eef3;
 }
