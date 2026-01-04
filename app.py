@@ -1,11 +1,8 @@
-# app.py — FINAL FIXED VERSION (PROMPT EDITOR GUARANTEED ON MAIN PAGE)
+# app.py — FINAL CORRECTED VERSION
 # -----------------------------------------------------------------------------
-# FEATURES:
-# 1. Prompt Editor located on the MAIN PAGE (Validated).
-# 2. Aggressive JSON Parsing.
-# 3. Visual QA Dashboard.
-# 4. Robust Gemini Integration.
-# 5. Multi-Threaded Processing.
+# FIXES:
+# 1. Removed duplicate 'st.set_page_config' (which caused the app to crash/not update).
+# 2. PROMPT EDITOR IS EXPLICITLY ON THE MAIN PAGE (Not Sidebar).
 # -----------------------------------------------------------------------------
 
 import streamlit as st
@@ -18,23 +15,20 @@ import logging
 import mimetypes
 import tempfile
 import random
-import math 
-import html
 import re
 from io import BytesIO
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Dict, Any
 
+# --- 1. PAGE CONFIG (Must be the very first Streamlit command) ---
+st.set_page_config(page_title="QA Auditor", layout="wide")
+
 # --- CONFIGURATION ---
 BASE_URL = "https://generativelanguage.googleapis.com"
 UPLOAD_URL = "https://generativelanguage.googleapis.com/upload/v1beta/files"
 MODEL_NAME = "gemini-2.0-flash-exp" 
-
-# Streaming download chunk size (8KB)
 DOWNLOAD_CHUNK_SIZE = 8192
-
-# Job-level retry configuration
 MAX_WORKER_RETRIES = 3 
 WORKER_BACKOFF_BASE = 2 
 
@@ -46,10 +40,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("transcriber")
 
-# --- UI STYLING (CSS) ---
+# --- UI STYLING ---
 BASE_CSS = """
 <style>
-/* Dashboard Metric Card Style */
+/* Metric Card Style */
 .metric-box {
     background-color: var(--card-bg, #f8f9fa);
     border: 1px solid var(--border-color, #eee);
@@ -60,86 +54,59 @@ BASE_CSS = """
     box-shadow: 0 1px 3px rgba(0,0,0,0.05);
 }
 .metric-title { 
-    font-size: 0.85em; 
-    font-weight: 700; 
-    color: var(--meta-color, #666); 
-    text-transform: uppercase; 
-    letter-spacing: 0.5px; 
-    margin-bottom: 5px;
+    font-size: 0.85em; font-weight: 700; color: var(--meta-color, #666); 
+    text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 5px;
 }
 .metric-value { 
-    font-size: 2.0em; 
-    font-weight: 800; 
-    margin: 0; 
-    line-height: 1.2;
+    font-size: 2.0em; font-weight: 800; margin: 0; line-height: 1.2;
 }
 .metric-sub { 
-    font-size: 0.8em; 
-    color: var(--meta-color, #888); 
-    margin-top: 4px;
+    font-size: 0.8em; color: var(--meta-color, #888); margin-top: 4px;
 }
 
-/* Global Theme Variables */
+/* Themes */
 .dark-theme {
-    --card-bg: #1e2126;
-    --border-color: #333;
-    --meta-color: #9aa0a6;
-    color: #e6eef3;
+    --card-bg: #1e2126; --border-color: #333; --meta-color: #9aa0a6; color: #e6eef3;
 }
 .light-theme {
-    --card-bg: #ffffff;
-    --border-color: #e6e6e6;
-    --meta-color: #666666;
-    color: #111;
+    --card-bg: #ffffff; --border-color: #e6e6e6; --meta-color: #666666; color: #111;
 }
-
-/* Expander Styling */
-.streamlit-expanderHeader {
-    font-weight: 600;
-}
+.streamlit-expanderHeader { font-weight: 600; }
 </style>
 """
+st.markdown(BASE_CSS, unsafe_allow_html=True)
 
-# --- NETWORK UTILITIES ---
+
+# --- UTILITIES ---
 
 def _sleep_with_jitter(base_seconds: float, attempt: int):
-    """Sleeps with jitter to prevent rate limit spikes."""
     jitter = random.uniform(0.5, 1.5)
     to_sleep = min(base_seconds * (2 ** attempt) * jitter, 30)
     time.sleep(to_sleep)
 
 def make_request_with_retry(method: str, url: str, max_retries: int = 5, backoff_base: float = 0.5, **kwargs) -> requests.Response:
-    """Robust HTTP request wrapper with exponential backoff."""
     last_exc = None
     for attempt in range(max_retries):
         try:
             resp = requests.request(method, url, timeout=60, **kwargs)
             if resp.status_code == 429 or (500 <= resp.status_code < 600):
-                logger.warning("Transient HTTP %s from %s. Retrying...", resp.status_code, url)
                 _sleep_with_jitter(backoff_base, attempt)
                 continue
             return resp
         except requests.exceptions.RequestException as e:
             last_exc = e
-            logger.warning("RequestException: %s. Retrying...", str(e))
             _sleep_with_jitter(backoff_base, attempt)
-            
     if last_exc: raise last_exc
     raise Exception("Retries exhausted")
 
-
-# --- GOOGLE UPLOAD PIPELINE ---
-
 def detect_extension_and_mime(url_path: str, header_content_type: Optional[str]) -> (str, str):
-    """Detects audio format from URL or Content-Type header."""
     COMMON_AUDIO_MIME = {
         ".mp3": "audio/mpeg", ".wav": "audio/wave", ".m4a": "audio/mp4",
         ".aac": "audio/aac", ".ogg": "audio/ogg", ".webm": "audio/webm", ".flac": "audio/flac"
     }
     _, ext = os.path.splitext(url_path or "")
     ext = ext.lower()
-    if ext and ext in COMMON_AUDIO_MIME: 
-        return ext, COMMON_AUDIO_MIME[ext]
+    if ext and ext in COMMON_AUDIO_MIME: return ext, COMMON_AUDIO_MIME[ext]
     if header_content_type:
         ctype = header_content_type.split(";")[0].strip()
         for k, v in COMMON_AUDIO_MIME.items():
@@ -190,28 +157,17 @@ def delete_file(api_key: str, file_name: str):
     try: requests.delete(f"{BASE_URL}/v1beta/{file_name}?key={api_key}", timeout=20)
     except: pass
 
-
-# --- GEMINI GENERATION (JSON ENFORCED) ---
-
 def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str) -> str:
     api_url = f"{BASE_URL}/v1beta/models/{MODEL_NAME}:generateContent?key={api_key}"
+    if "JSON" not in prompt.upper(): prompt += "\n\nCRITICAL: Output strictly valid JSON."
     
-    if "JSON" not in prompt.upper():
-        prompt += "\n\nCRITICAL: Output strictly valid JSON."
-
     payload = {
         "contents": [{"parts": [{"text": prompt}, {"file_data": {"mime_type": mime_type, "file_uri": file_uri}}]}],
-        "generationConfig": {
-            "temperature": 0.2, 
-            "maxOutputTokens": 8192,
-            "response_mime_type": "application/json"
-        }
+        "generationConfig": { "temperature": 0.2, "maxOutputTokens": 8192, "response_mime_type": "application/json" }
     }
-    
     for attempt in range(3):
         resp = make_request_with_retry("POST", api_url, json=payload, headers={"Content-Type": "application/json"})
         if resp.status_code != 200: return f"API ERROR {resp.status_code}: {resp.text}"
-        
         try:
             body = resp.json()
             candidates = body.get("candidates") or []
@@ -219,13 +175,8 @@ def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str
                 text = candidates[0].get("content", {}).get("parts", [])[0].get("text", "")
                 if text.strip(): return text
         except: pass
-        
         time.sleep(2 * (attempt + 1))
-        
     return "{}"
-
-
-# --- DATA PREPARATION ---
 
 def prepare_all_rows(df: pd.DataFrame) -> pd.DataFrame:
     final_rows = []
@@ -241,9 +192,6 @@ def prepare_all_rows(df: pd.DataFrame) -> pd.DataFrame:
             r['status'] = 'Skipped'
         final_rows.append(r)
     return pd.DataFrame(final_rows).reset_index(drop=True)
-
-
-# --- WORKER FUNCTION ---
 
 def process_single_row(index: int, row: pd.Series, api_key: str, final_prompt: str, keep_remote: bool) -> Dict[str, Any]:
     result = {
@@ -290,36 +238,27 @@ def process_single_row(index: int, row: pd.Series, api_key: str, final_prompt: s
             if file_info and not keep_remote: delete_file(api_key, file_info["name"])
     return result
 
-
-# --- DASHBOARD UTILS ---
-
 def aggressive_json_parse(text: str) -> Optional[Dict]:
     if not text: return None
     try:
         start = text.find("{")
         end = text.rfind("}")
         if start != -1 and end != -1:
-            json_candidate = text[start : end + 1]
-            return json.loads(json_candidate)
+            return json.loads(text[start : end + 1])
         return None
-    except json.JSONDecodeError:
-        return None
+    except: return None
 
 def render_dashboard_card(data: Dict):
     status = data.get("overall_status", "UNKNOWN")
-    if status == "PASS":
-        st.success(f"### Overall Status: {status} ✅")
-    elif status == "FAIL":
-        st.error(f"### Overall Status: {status} ❌")
-    else:
-        st.info(f"### Overall Status: {status}")
+    if status == "PASS": st.success(f"### Overall Status: {status} ✅")
+    elif status == "FAIL": st.error(f"### Overall Status: {status} ❌")
+    else: st.info(f"### Overall Status: {status}")
 
     scores = data.get("scores", {})
     if scores:
         st.markdown("#### 📊 Performance Metrics")
         items = list(scores.items())
         chunks = [items[i:i + 4] for i in range(0, len(items), 4)]
-
         for chunk in chunks:
             cols = st.columns(len(chunk))
             for i, (key, details) in enumerate(chunk):
@@ -327,19 +266,13 @@ def render_dashboard_card(data: Dict):
                     val = details.get("score", 0.0)
                     conf = details.get("confidence_score", 0.0)
                     color = "#28a745" if val >= 0.8 else "#ffc107" if val >= 0.5 else "#dc3545"
-                    st.markdown(
-                        f"""
+                    st.markdown(f"""
                         <div class="metric-box">
                             <div class="metric-title">{key.replace('_', ' ')}</div>
                             <div class="metric-value" style="color: {color}">{val}</div>
                             <div class="metric-sub">Conf: {int(conf*100)}%</div>
-                        </div>
-                        """, 
-                        unsafe_allow_html=True
-                    )
-
+                        </div>""", unsafe_allow_html=True)
     st.divider()
-
     st.markdown("#### 📝 Detailed Reasoning")
     if scores:
         for key, details in scores.items():
@@ -347,10 +280,8 @@ def render_dashboard_card(data: Dict):
             icon = "🟢" if s_val >= 0.8 else "🔴" if s_val < 0.5 else "🟡"
             with st.expander(f"{icon} {key.replace('_', ' ').title()}"):
                 st.write(f"**Reasoning:** {details.get('reasoning', 'No reasoning provided.')}")
-                ts = details.get("timestamp_of_issue")
-                if ts: st.warning(f"⚠️ Issue detected at timestamp: **{ts}**")
+                if details.get("timestamp_of_issue"): st.warning(f"⚠️ Issue detected at: **{details.get('timestamp_of_issue')}**")
 
-# --- DEFAULT PROMPT ---
 DEFAULT_AUDIT_PROMPT = """Analyze this call recording for Quality Assurance.
 
 OUTPUT FORMAT (STRICT JSON):
@@ -372,17 +303,13 @@ OUTPUT FORMAT (STRICT JSON):
 }
 """
 
-# --- MAIN APP ENTRY POINT ---
+# --- MAIN APP ---
 
 def main():
-    # 1. Page Config
-    st.set_page_config(page_title="QA Auditor", layout="wide")
-    st.markdown(BASE_CSS, unsafe_allow_html=True)
-    
     if "processed_results" not in st.session_state: st.session_state.processed_results = []
     if "final_df" not in st.session_state: st.session_state.final_df = pd.DataFrame()
 
-    # 2. Sidebar (ISOLATED BLOCK)
+    # --- SIDEBAR (SETTINGS ONLY) ---
     with st.sidebar:
         st.header("⚙️ Settings")
         api_key = st.text_input("Gemini API Key", type="password")
@@ -393,26 +320,19 @@ def main():
         st.divider()
         theme_choice = st.radio("UI Theme", ["Light", "Dark"], 0, horizontal=True)
 
-    # Theme Injection
     theme_class = "dark-theme" if theme_choice == "Dark" else "light-theme"
     st.markdown(f"<div class='{theme_class}'>", unsafe_allow_html=True)
 
-    # 3. MAIN PAGE CONTENT (Starts Here - Outside Sidebar)
+    # --- MAIN PAGE CONTENT ---
     st.title("🤖 QA Call Auditor")
     
-    # --- PROMPT EDITOR SECTION ---
+    # 1. PROMPT EDITOR (Explicitly here on main page)
     st.markdown("### 📝 Edit System Prompt")
     st.caption("Define your JSON structure here. The dashboard will adapt automatically.")
-    
-    prompt_input = st.text_area(
-        "System Prompt Input", 
-        value=DEFAULT_AUDIT_PROMPT, 
-        height=250,
-        label_visibility="collapsed"
-    )
-    # -----------------------------
+    prompt_input = st.text_area("System Prompt Input", value=DEFAULT_AUDIT_PROMPT, height=250, label_visibility="collapsed")
 
-    st.write("### 📂 Upload Excel Batch")
+    # 2. File Upload
+    st.markdown("### 📂 Upload Excel Batch")
     uploaded_files = st.file_uploader("Select .xlsx files", type=["xlsx"], accept_multiple_files=True)
 
     progress_bar = st.empty()
@@ -424,8 +344,7 @@ def main():
         
         all_dfs = [pd.read_excel(f) for f in uploaded_files]
         raw_df = pd.concat(all_dfs, ignore_index=True)
-        if "recording_url" not in raw_df.columns: 
-            st.error("Missing 'recording_url' column in Excel."); st.stop()
+        if "recording_url" not in raw_df.columns: st.error("Missing 'recording_url' column in Excel."); st.stop()
 
         df_ready = prepare_all_rows(raw_df)
         final_prompt = prompt_input + f"\n\nContext Language: {language_mode}"
@@ -445,7 +364,7 @@ def main():
         st.session_state.final_df = pd.DataFrame(st.session_state.processed_results)
         status_text.success("Batch Processing Complete!")
 
-    # Results Viewer
+    # 3. Results
     df = st.session_state.final_df
     if not df.empty:
         st.markdown("---")
