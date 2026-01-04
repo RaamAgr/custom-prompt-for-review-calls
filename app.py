@@ -1,8 +1,8 @@
-# app.py — COMPLETE QA AUDIT SYSTEM (FULL CODE)
+# app.py — FINAL QA AUDITOR (MAIN PAGE PROMPT EDITOR)
 # -----------------------------------------------------------------------------
 # FEATURES:
-# 1. Main Page Prompt Editor.
-# 2. Aggressive JSON Parsing (Detects JSON inside Markdown/Text).
+# 1. Prompt Editor located prominently on the MAIN PAGE (Not sidebar).
+# 2. Aggressive JSON Parsing (Fixes "showing text as normal" issue).
 # 3. Visual QA Dashboard (Metrics, Progress Bars, Banners).
 # 4. Robust Gemini Integration (Resumable Uploads, Polling, Retries).
 # 5. Multi-Threaded Processing (Up to 128 workers).
@@ -444,14 +444,15 @@ def main():
     # --- MAIN PAGE ---
     st.title("🤖 QA Call Auditor")
     
-    # 1. Prompt Editor (On Main Page)
-    with st.expander("📝 Edit System Prompt & JSON Structure", expanded=True):
-        prompt_input = st.text_area(
-            "System Prompt", 
-            value=DEFAULT_AUDIT_PROMPT, 
-            height=250,
-            help="Define the strict JSON structure here. The dashboard will adapt to whatever keys you put in 'scores'."
-        )
+    # 1. Prompt Editor (On Main Page - NO SIDEBAR)
+    st.subheader("📝 Edit System Prompt")
+    st.caption("Define your JSON structure here. The dashboard will adapt automatically.")
+    prompt_input = st.text_area(
+        "System Prompt Input", 
+        value=DEFAULT_AUDIT_PROMPT, 
+        height=250,
+        label_visibility="collapsed"
+    )
 
     # 2. File Upload
     st.write("### 📂 Upload Excel Batch")
