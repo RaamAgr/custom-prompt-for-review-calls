@@ -1,11 +1,11 @@
-# app.py — FINAL QA AUDITOR (MAIN PAGE PROMPT EDITOR)
+# app.py — FINAL FIXED VERSION (PROMPT EDITOR ON MAIN PAGE)
 # -----------------------------------------------------------------------------
 # FEATURES:
-# 1. Prompt Editor located prominently on the MAIN PAGE (Not sidebar).
-# 2. Aggressive JSON Parsing (Fixes "showing text as normal" issue).
-# 3. Visual QA Dashboard (Metrics, Progress Bars, Banners).
+# 1. Prompt Editor located on the MAIN PAGE (Validated).
+# 2. Aggressive JSON Parsing.
+# 3. Visual QA Dashboard.
 # 4. Robust Gemini Integration (Resumable Uploads, Polling, Retries).
-# 5. Multi-Threaded Processing (Up to 128 workers).
+# 5. Multi-Threaded Processing.
 # -----------------------------------------------------------------------------
 
 import streamlit as st
@@ -445,7 +445,7 @@ def main():
     st.title("🤖 QA Call Auditor")
     
     # 1. Prompt Editor (On Main Page - NO SIDEBAR)
-    st.subheader("📝 Edit System Prompt")
+    st.write("#### 📝 Edit System Prompt")
     st.caption("Define your JSON structure here. The dashboard will adapt automatically.")
     prompt_input = st.text_area(
         "System Prompt Input", 
