@@ -1,4 +1,4 @@
-# app.py — COMPLETE BATCH TRANSCRIBER (ALL ROWS + EDITABLE PROMPT)
+# app.py — HYBRID BATCH PROCESSOR (TRANSCRIBER + QA AUDITOR)
 # -----------------------------------------------------------------------------
 # FEATURES INCLUDED:
 # 1. Multi-file Excel Upload (Merges multiple files).
@@ -7,7 +7,8 @@
 # 4. Empty Response Retry (Retries Gemini API if it returns empty text).
 # 5. High Concurrency (Slider up to 128 workers).
 # 6. Job-Level Retry (Retries the full sequence on transient failure).
-# 7. NEW: Editable System Prompt in UI.
+# 7. Editable System Prompt in UI.
+# 8. HYBRID VIEWER: Automatically renders Colorized Transcript OR JSON Dashboard.
 # -----------------------------------------------------------------------------
 
 import streamlit as st
@@ -22,6 +23,7 @@ import tempfile
 import random
 import math 
 import html
+import re
 from io import BytesIO
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,7 +32,8 @@ from typing import Optional, Dict, Any
 # --- CONFIGURATION ---
 BASE_URL = "https://generativelanguage.googleapis.com"
 UPLOAD_URL = "https://generativelanguage.googleapis.com/upload/v1beta/files"
-MODEL_NAME = "gemini-3-flash-preview" 
+# using the model from your snippet
+MODEL_NAME = "gemini-2.0-flash-exp" 
 
 # Streaming download chunk size (8KB)
 DOWNLOAD_CHUNK_SIZE = 8192
@@ -48,9 +51,10 @@ logging.basicConfig(
 logger = logging.getLogger("transcriber")
 
 # --- UI STYLING (CSS) ---
+# Merged CSS: Contains both Transcript Card styles AND Dashboard Metric styles
 BASE_CSS = """
 <style>
-/* Card look for transcript entries */
+/* --- TRANSCRIPT STYLES --- */
 .call-card {
     border: 1px solid var(--border-color, #e6e6e6);
     border-radius: 10px;
@@ -59,8 +63,6 @@ BASE_CSS = """
     background: var(--card-bg, #fff);
     box-shadow: 0 1px 3px rgba(0,0,0,0.04);
 }
-
-/* Transcript scroll area */
 .transcript-box {
     max-height: 320px;
     overflow: auto;
@@ -68,19 +70,28 @@ BASE_CSS = """
     border-radius: 6px;
     background: var(--transcript-bg, #fafafa);
     border: 1px solid var(--border-color, #eee);
-    font-family: monospace; /* Monospace helps alignment */
-    white-space: pre-wrap;  /* Preserves newlines */
+    font-family: monospace;
+    white-space: pre-wrap; 
 }
-
-/* Speaker colors for Diarization */
 .speaker1 { color: #1f77b4; font-weight: 600; display: block; margin-bottom: 4px; }
 .speaker2 { color: #d62728; font-weight: 600; display: block; margin-bottom: 4px; }
 .other-speech { color: #333; display: block; margin-bottom: 4px; }
-
-/* Compact metadata row */
 .meta-row { font-size: 13px; color: var(--meta-color, #666); margin-bottom: 8px; }
 
-/* Theming variables */
+/* --- DASHBOARD METRIC STYLES --- */
+.metric-box {
+    background-color: var(--card-bg, #f8f9fa);
+    border: 1px solid var(--border-color, #eee);
+    padding: 10px;
+    border-radius: 8px;
+    text-align: center;
+    margin-bottom: 10px;
+}
+.metric-title { font-size: 0.85em; font-weight: 600; color: var(--meta-color, #666); text-transform: uppercase; letter-spacing: 0.5px; }
+.metric-value { font-size: 1.8em; font-weight: 700; margin: 5px 0; }
+.metric-sub { font-size: 0.75em; color: var(--meta-color, #888); }
+
+/* --- THEME VARIABLES --- */
 .dark-theme {
     --card-bg: #0f1115;
     --transcript-bg: #0b0c0f;
@@ -96,12 +107,11 @@ BASE_CSS = """
     color: #111;
 }
 
-/* Search box styling */
 .search-box { margin-bottom: 10px; padding: 6px; border-radius: 6px; border: 1px solid var(--border-color, #eee); width:100%; }
 </style>
 """
 
-st.set_page_config(page_title="Batch Transcriber", layout="wide")
+st.set_page_config(page_title="Batch Transcriber & Auditor", layout="wide")
 st.markdown(BASE_CSS, unsafe_allow_html=True)
 
 
@@ -297,6 +307,19 @@ def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str
     """
     api_url = f"{BASE_URL}/v1beta/models/{MODEL_NAME}:generateContent?key={api_key}"
 
+    # Auto-detect if user wants JSON (simple check for keyword "JSON" in prompt)
+    is_json_request = "JSON" in prompt.upper()
+    
+    generation_config = {
+        "temperature": 0.2,
+        "maxOutputTokens": 8192
+    }
+    
+    # If users prompt explicitly asks for JSON, we hint the model to output JSON mime type
+    # (Only supported on newer Flash models, safe to add)
+    if is_json_request:
+        generation_config["response_mime_type"] = "application/json"
+
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -312,10 +335,7 @@ def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str
             ]
         }],
         "safetySettings": safety_settings,
-        "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 8192
-        }
+        "generationConfig": generation_config
     }
 
     # RETRY LOOP FOR CONTENT
@@ -569,7 +589,84 @@ def colorize_transcript_html(text: str) -> str:
             
     return f"<div>{html_output}</div>"
 
-# --- DEFAULT PROMPT TEMPLATE ---
+
+# --- DYNAMIC DASHBOARD RENDERER (NEW) ---
+
+def extract_json_safe(text: str) -> Optional[Dict]:
+    """Extracts JSON object from text, handling markdown fences."""
+    try:
+        # 1. Attempt strict match first
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        # 2. Attempt cleanup if strict match failed but text looks like JSON
+        cleaned = text.strip()
+        if cleaned.startswith("```json"):
+            cleaned = cleaned.replace("```json", "").replace("```", "")
+        return json.loads(cleaned)
+    except:
+        return None
+
+def render_dynamic_dashboard(data: Dict):
+    """
+    Dynamically renders metrics found in the JSON output.
+    Does not rely on hardcoded keys. Adapts to new sections automatically.
+    """
+    # --- 1. OVERALL STATUS BANNER ---
+    status = data.get("overall_status", "UNKNOWN")
+    if status == "PASS":
+        st.success(f"### Overall Status: {status} ✅")
+    elif status == "FAIL":
+        st.error(f"### Overall Status: {status} ❌")
+    else:
+        st.info(f"### Overall Status: {status}")
+
+    # --- 2. DYNAMIC SCORES GRID ---
+    scores = data.get("scores", {})
+    if scores:
+        st.markdown("#### 📊 Performance Metrics")
+        
+        # Helper to chunk dictionary items into rows of 4
+        def chunked(it, size):
+            it = iter(it)
+            while True:
+                p = tuple(next(it) for _ in range(size))
+                if not p: break
+                yield p
+
+        for chunk in chunked(scores.items(), 4):
+            cols = st.columns(len(chunk))
+            for i, (key, details) in enumerate(chunk):
+                with cols[i]:
+                    val = details.get("score", 0)
+                    conf = details.get("confidence_score", 0)
+                    color = "#28a745" if val >= 0.8 else "#ffc107" if val >= 0.5 else "#dc3545" # Green, Yellow, Red
+                    st.markdown(
+                        f"""
+                        <div class="metric-box">
+                            <div class="metric-title">{key.replace('_', ' ')}</div>
+                            <div class="metric-value" style="color: {color}">{val}</div>
+                            <div class="metric-sub">Conf: {int(conf*100)}%</div>
+                        </div>
+                        """, 
+                        unsafe_allow_html=True
+                    )
+    
+    st.divider()
+
+    # --- 3. REASONING EXPANDERS ---
+    st.markdown("#### 📝 Detailed Reasoning")
+    if scores:
+        for key, details in scores.items():
+            s_val = details.get("score", 0)
+            icon = "🟢" if s_val >= 0.8 else "🔴" if s_val < 0.5 else "🟡"
+            with st.expander(f"{icon} {key.replace('_', ' ').title()} Details"):
+                st.write(f"**Reasoning:** {details.get('reasoning', 'No reasoning provided.')}")
+                ts = details.get("timestamp_of_issue")
+                if ts:
+                    st.warning(f"⚠️ Timestamp of Issue: **{ts}**")
+
+# --- DEFAULT PROMPT TEMPLATE (ORIGINAL DIARIZATION) ---
 DEFAULT_PROMPT_TEMPLATE = """Transcribe this call in {language} exactly as spoken.
 
 CRITICAL REQUIREMENTS — FOLLOW STRICTLY:
@@ -645,6 +742,7 @@ def main():
                 value=DEFAULT_PROMPT_TEMPLATE, 
                 height=300
             )
+            st.info("Tip: If you paste a JSON Prompt here, the Dashboard will automatically visualize it!")
 
         st.divider()
         theme_choice = st.radio("Theme", options=["Light", "Dark"], index=0, horizontal=True)
@@ -763,12 +861,12 @@ def main():
 
     if not final_df.empty:
         st.markdown("<hr/>", unsafe_allow_html=True)
-        st.markdown("## 🎛️ Transcript Browser")
+        st.markdown("## 🎛️ Transcript & Audit Browser")
 
         # Filters Layout
         col_a, col_b, col_c, col_d = st.columns([3, 1, 1, 1])
         with col_a:
-            search_q = st.text_input("Search", placeholder="Search transcript, phone, or URL...")
+            search_q = st.text_input("Search", placeholder="Search transcript, JSON, phone, or URL...")
         with col_b:
             status_sel = st.selectbox("Status", ["All", "Success", "Failed", "Skipped"])
         with col_c:
@@ -833,10 +931,22 @@ def main():
                 meta_html = f"<div class='meta-row'><b>URL:</b> {url_val}</div>"
                 st.markdown(meta_html, unsafe_allow_html=True)
                 
-                # Transcript Box
+                # --- HYBRID VIEWER LOGIC ---
                 transcript_text = row.get("transcript", "")
-                transcript_html = colorize_transcript_html(transcript_text)
-                st.markdown(f"<div class='transcript-box'>{transcript_html}</div>", unsafe_allow_html=True)
+                
+                # 1. Attempt to detect JSON (QA Dashboard Mode)
+                json_data = extract_json_safe(transcript_text)
+                
+                if json_data:
+                    # RENDER DASHBOARD
+                    render_dynamic_dashboard(json_data)
+                    # Also provide option to see raw text
+                    with st.expander("Show Raw JSON Output"):
+                        st.code(transcript_text, language="json")
+                else:
+                    # RENDER STANDARD TRANSCRIPT (Old App Style)
+                    transcript_html = colorize_transcript_html(transcript_text)
+                    st.markdown(f"<div class='transcript-box'>{transcript_html}</div>", unsafe_allow_html=True)
                 
                 # Error display if present
                 if row.get("error"):
