@@ -1,14 +1,10 @@
-# app.py — HYBRID BATCH PROCESSOR (TRANSCRIBER + QA AUDITOR)
+# app.py — QA AUDIT DASHBOARD (JSON ONLY VERSION)
 # -----------------------------------------------------------------------------
 # FEATURES INCLUDED:
-# 1. Multi-file Excel Upload (Merges multiple files).
-# 2. Robust Gemini API Integration (Resumable Uploads, Polling, Retries).
-# 3. PROCESSES EVERY ROW (No unique mobile number filtering).
-# 4. Empty Response Retry (Retries Gemini API if it returns empty text).
-# 5. High Concurrency (Slider up to 128 workers).
-# 6. Job-Level Retry (Retries the full sequence on transient failure).
-# 7. Editable System Prompt in UI.
-# 8. HYBRID VIEWER: Automatically renders Colorized Transcript OR JSON Dashboard.
+# 1. Main Page Prompt Editor (No longer hidden in sidebar).
+# 2. Aggressive JSON Parsing (Fixes "showing text as normal" issue).
+# 3. Dedicated QA Dashboard (Visual metrics, progress bars, status banners).
+# 4. Process Every Row + High Concurrency.
 # -----------------------------------------------------------------------------
 
 import streamlit as st
@@ -32,17 +28,16 @@ from typing import Optional, Dict, Any
 # --- CONFIGURATION ---
 BASE_URL = "https://generativelanguage.googleapis.com"
 UPLOAD_URL = "https://generativelanguage.googleapis.com/upload/v1beta/files"
-# using the model from your snippet
 MODEL_NAME = "gemini-2.0-flash-exp" 
 
 # Streaming download chunk size (8KB)
 DOWNLOAD_CHUNK_SIZE = 8192
 
 # Job-level retry configuration
-MAX_WORKER_RETRIES = 3 # Number of attempts per row (initial + 2 retries)
-WORKER_BACKOFF_BASE = 2 # Base seconds for backoff (5s, 10s, 20s)
+MAX_WORKER_RETRIES = 3 
+WORKER_BACKOFF_BASE = 2 
 
-# Configure logging to console
+# Configure logging
 logging.basicConfig(
     format="%(asctime)s %(levelname)s: %(message)s",
     level=logging.INFO,
@@ -50,569 +45,263 @@ logging.basicConfig(
 )
 logger = logging.getLogger("transcriber")
 
-# --- UI STYLING (CSS) ---
-# Merged CSS: Contains both Transcript Card styles AND Dashboard Metric styles
+# --- UI STYLING ---
 BASE_CSS = """
 <style>
-/* --- TRANSCRIPT STYLES --- */
-.call-card {
-    border: 1px solid var(--border-color, #e6e6e6);
-    border-radius: 10px;
-    padding: 12px;
-    margin-bottom: 12px;
-    background: var(--card-bg, #fff);
-    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
-}
-.transcript-box {
-    max-height: 320px;
-    overflow: auto;
-    padding: 8px;
-    border-radius: 6px;
-    background: var(--transcript-bg, #fafafa);
-    border: 1px solid var(--border-color, #eee);
-    font-family: monospace;
-    white-space: pre-wrap; 
-}
-.speaker1 { color: #1f77b4; font-weight: 600; display: block; margin-bottom: 4px; }
-.speaker2 { color: #d62728; font-weight: 600; display: block; margin-bottom: 4px; }
-.other-speech { color: #333; display: block; margin-bottom: 4px; }
-.meta-row { font-size: 13px; color: var(--meta-color, #666); margin-bottom: 8px; }
-
-/* --- DASHBOARD METRIC STYLES --- */
+/* Dashboard Card Style */
 .metric-box {
     background-color: var(--card-bg, #f8f9fa);
     border: 1px solid var(--border-color, #eee);
-    padding: 10px;
-    border-radius: 8px;
+    padding: 15px;
+    border-radius: 10px;
     text-align: center;
     margin-bottom: 10px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
 }
-.metric-title { font-size: 0.85em; font-weight: 600; color: var(--meta-color, #666); text-transform: uppercase; letter-spacing: 0.5px; }
-.metric-value { font-size: 1.8em; font-weight: 700; margin: 5px 0; }
-.metric-sub { font-size: 0.75em; color: var(--meta-color, #888); }
+.metric-title { 
+    font-size: 0.9em; 
+    font-weight: 600; 
+    color: var(--meta-color, #666); 
+    text-transform: uppercase; 
+    letter-spacing: 0.5px; 
+    margin-bottom: 5px;
+}
+.metric-value { 
+    font-size: 2.2em; 
+    font-weight: 800; 
+    margin: 0; 
+    line-height: 1.2;
+}
+.metric-sub { 
+    font-size: 0.8em; 
+    color: var(--meta-color, #888); 
+    margin-top: 4px;
+}
 
-/* --- THEME VARIABLES --- */
+/* Theme Variables */
 .dark-theme {
-    --card-bg: #0f1115;
-    --transcript-bg: #0b0c0f;
-    --border-color: #222428;
+    --card-bg: #1e2126;
+    --border-color: #333;
     --meta-color: #9aa0a6;
     color: #e6eef3;
 }
 .light-theme {
     --card-bg: #ffffff;
-    --transcript-bg: #fafafa;
     --border-color: #e6e6e6;
     --meta-color: #666666;
     color: #111;
 }
-
-.search-box { margin-bottom: 10px; padding: 6px; border-radius: 6px; border: 1px solid var(--border-color, #eee); width:100%; }
 </style>
 """
 
-st.set_page_config(page_title="Batch Transcriber & Auditor", layout="wide")
+st.set_page_config(page_title="QA Auditor", layout="wide")
 st.markdown(BASE_CSS, unsafe_allow_html=True)
 
 
 # --- NETWORK UTILITIES ---
 
 def _sleep_with_jitter(base_seconds: float, attempt: int):
-    """
-    Sleeps for a random amount of time to prevent thundering herd problems.
-    Formula: base * (2^attempt) * jitter
-    """
     jitter = random.uniform(0.5, 1.5)
     to_sleep = min(base_seconds * (2 ** attempt) * jitter, 30)
     time.sleep(to_sleep)
 
 def make_request_with_retry(method: str, url: str, max_retries: int = 5, backoff_base: float = 0.5, **kwargs) -> requests.Response:
-    """
-    Robust wrapper for requests with exponential backoff + jitter.
-    Handles 429 (Rate Limit) and 5xx (Server Errors).
-    """
     last_exc = None
     for attempt in range(max_retries):
         try:
             resp = requests.request(method, url, timeout=60, **kwargs)
-            # Treat 429 and 5xx as transient errors
             if resp.status_code == 429 or (500 <= resp.status_code < 600):
-                logger.warning("Transient HTTP %s from %s (attempt %d). Retrying...", resp.status_code, url, attempt + 1)
+                logger.warning("Transient HTTP %s. Retrying...", resp.status_code)
                 _sleep_with_jitter(backoff_base, attempt)
                 continue
             return resp
         except requests.exceptions.RequestException as e:
-            logger.warning("RequestException on %s %s: %s (attempt %d)", method, url, str(e), attempt + 1)
             last_exc = e
             _sleep_with_jitter(backoff_base, attempt)
-      
-    # All retries exhausted
-    if last_exc:
-        raise last_exc
-    raise Exception("make_request_with_retry: retries exhausted without a response")
-
-
-# --- MIME TYPE & FILE EXTENSION HANDLING ---
-
-COMMON_AUDIO_MIME = {
-    ".mp3": "audio/mpeg",
-    ".wav": "audio/wave",
-    ".m4a": "audio/mp4",
-    ".aac": "audio/aac",
-    ".ogg": "audio/ogg",
-    ".oga": "audio/ogg",
-    ".webm": "audio/webm",
-    ".flac": "audio/flac"
-}
-
-def detect_extension_and_mime(url_path: str, header_content_type: Optional[str]) -> (str, str):
-    """
-    Determine extension and mime type from URL path and header.
-    Prioritize path extension, else header, else default to MP3.
-    """
-    _, ext = os.path.splitext(url_path or "")
-    ext = ext.lower()
-    
-    # 1. Trust extension if it is a known audio type
-    if ext and ext in COMMON_AUDIO_MIME:
-        return ext, COMMON_AUDIO_MIME[ext]
-    
-    # 2. Try header Content-Type
-    if header_content_type:
-        ctype = header_content_type.split(";")[0].strip()
-        # Reverse lookup map
-        for k, v in COMMON_AUDIO_MIME.items():
-            if v == ctype:
-                return k, ctype
-        
-        # Attempt standard python guess
-        guessed_ext = mimetypes.guess_extension(ctype)
-        if guessed_ext:
-            return guessed_ext.lower(), ctype
-            
-    # 3. Last fallback: Default to MP3
-    # Google File API is strict; MP3 container usually handles varied bitstreams well.
-    return ".mp3", "audio/mpeg"
+    if last_exc: raise last_exc
+    raise Exception("Retries exhausted")
 
 
 # --- GOOGLE UPLOAD PIPELINE ---
 
+def detect_extension_and_mime(url_path: str, header_content_type: Optional[str]) -> (str, str):
+    COMMON_AUDIO_MIME = {
+        ".mp3": "audio/mpeg", ".wav": "audio/wave", ".m4a": "audio/mp4",
+        ".aac": "audio/aac", ".ogg": "audio/ogg", ".webm": "audio/webm", ".flac": "audio/flac"
+    }
+    _, ext = os.path.splitext(url_path or "")
+    ext = ext.lower()
+    if ext and ext in COMMON_AUDIO_MIME: return ext, COMMON_AUDIO_MIME[ext]
+    if header_content_type:
+        ctype = header_content_type.split(";")[0].strip()
+        for k, v in COMMON_AUDIO_MIME.items():
+            if v == ctype: return k, ctype
+        guessed = mimetypes.guess_extension(ctype)
+        if guessed: return guessed.lower(), ctype
+    return ".mp3", "audio/mpeg"
+
 def initiate_upload(api_key: str, display_name: str, mime_type: str, file_size: int) -> str:
-    """
-    Starts a resumable upload session with the Google File API.
-    Returns the unique upload URL.
-    """
     url = f"{UPLOAD_URL}?uploadType=resumable&key={api_key}"
     headers = {
         "Content-Type": "application/json; charset=UTF-8",
-        "X-Goog-Upload-Protocol": "resumable",
-        "X-Goog-Upload-Command": "start",
-        "X-Goog-Upload-Header-Content-Length": str(file_size),
-        "X-Goog-Upload-Header-Content-Type": mime_type,
+        "X-Goog-Upload-Protocol": "resumable", "X-Goog-Upload-Command": "start",
+        "X-Goog-Upload-Header-Content-Length": str(file_size), "X-Goog-Upload-Header-Content-Type": mime_type,
     }
     payload = json.dumps({"file": {"display_name": display_name}})
-    
     resp = make_request_with_retry("POST", url, headers=headers, data=payload)
-    
-    if resp.status_code not in (200, 201):
-        logger.error("initiate_upload failed: %s %s", resp.status_code, resp.text)
-        raise Exception(f"Init failed ({resp.status_code}): {resp.text}")
-    
-    upload_url = resp.headers.get("X-Goog-Upload-URL")
-    if not upload_url:
-        raise Exception("Failed to get upload URL from Google.")
-    return upload_url
+    if resp.status_code not in (200, 201): raise Exception(f"Init failed: {resp.text}")
+    return resp.headers.get("X-Goog-Upload-URL")
 
 def upload_bytes(upload_url: str, file_path: str, mime_type: str) -> Dict[str, Any]:
-    """
-    Streams file bytes to the upload URL and finalizes the file.
-    """
     file_size = os.path.getsize(file_path)
     headers = {
-        "Content-Type": mime_type or "application/octet-stream",
-        "Content-Length": str(file_size),
-        "X-Goog-Upload-Offset": "0",
-        "X-Goog-Upload-Command": "upload, finalize"
+        "Content-Type": mime_type or "application/octet-stream", "Content-Length": str(file_size),
+        "X-Goog-Upload-Offset": "0", "X-Goog-Upload-Command": "upload, finalize"
     }
-
-    # Try POST first (standard streaming)
     with open(file_path, "rb") as f:
         resp = requests.post(upload_url, headers=headers, data=f, timeout=300)
-
-    # Fallback: some endpoints expect PUT for finalize
-    if resp.status_code == 400:
+    if resp.status_code == 400: # Fallback
         with open(file_path, "rb") as f:
             resp = requests.put(upload_url, headers=headers, data=f, timeout=300)
-
-    if resp.status_code not in (200, 201):
-        logger.error("Upload failed: %s %s", resp.status_code, resp.text)
-        raise Exception(f"UPLOAD FAILED {resp.status_code}: {resp.text}")
-
-    try:
-        j = resp.json()
-    except ValueError:
-        raise Exception("Upload finished but server returned non-JSON response.")
-    
-    # Return the file metadata
-    return j.get("file", j)
-
-
-# --- GOOGLE FILE STATUS POLLING ---
+    if resp.status_code not in (200, 201): raise Exception(f"Upload failed: {resp.text}")
+    return resp.json().get("file", resp.json())
 
 def wait_for_active(api_key: str, file_name: str, timeout_seconds: int = 300) -> bool:
-    """
-    Polls the file status endpoint until state is ACTIVE or FAILED.
-    """
     url = f"{BASE_URL}/v1beta/{file_name}?key={api_key}"
     start = time.time()
-    
     while True:
         resp = make_request_with_retry("GET", url)
-        if resp.status_code != 200:
-            logger.warning("Status poll: got %s. Retrying...", resp.status_code)
-            time.sleep(2)
-        else:
-            j = resp.json()
-            state = j.get("state")
-            logger.debug("Polled file %s state=%s", file_name, state)
-            
-            if state == "ACTIVE":
-                return True
-            
-            if state == "FAILED":
-                raise Exception(f"File processing failed: {j.get('processingError', j)}")
-            
-            # If PROCESSING, wait and loop
-            time.sleep(2)
-
-        if time.time() - start > timeout_seconds:
-            raise Exception("Timed out waiting for file to become ACTIVE.")
+        if resp.status_code == 200:
+            state = resp.json().get("state")
+            if state == "ACTIVE": return True
+            if state == "FAILED": raise Exception(f"Processing failed: {resp.json()}")
+        time.sleep(2)
+        if time.time() - start > timeout_seconds: raise Exception("Timed out waiting for file.")
 
 def delete_file(api_key: str, file_name: str):
-    """
-    Deletes the file from Google servers to clean up storage.
-    """
-    try:
-        requests.delete(f"{BASE_URL}/v1beta/{file_name}?key={api_key}", timeout=20)
-    except Exception as e:
-        logger.warning("delete_file failed for %s: %s", file_name, str(e))
+    try: requests.delete(f"{BASE_URL}/v1beta/{file_name}?key={api_key}", timeout=20)
+    except: pass
 
 
-# --- TRANSCRIPTION API CALL ---
+# --- GEMINI GENERATION (JSON ENFORCED) ---
 
 def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str) -> str:
-    """
-    Calls Gemini v1beta generateContent to transcribe the audio.
-    INCLUDES RETRY LOGIC for empty responses.
-    """
     api_url = f"{BASE_URL}/v1beta/models/{MODEL_NAME}:generateContent?key={api_key}"
-
-    # Auto-detect if user wants JSON (simple check for keyword "JSON" in prompt)
-    is_json_request = "JSON" in prompt.upper()
     
-    generation_config = {
-        "temperature": 0.2,
-        "maxOutputTokens": 8192
-    }
-    
-    # If users prompt explicitly asks for JSON, we hint the model to output JSON mime type
-    # (Only supported on newer Flash models, safe to add)
-    if is_json_request:
-        generation_config["response_mime_type"] = "application/json"
-
-    safety_settings = [
-        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
-    ]
+    # Force JSON in prompt if missing
+    if "JSON" not in prompt.upper():
+        prompt += "\n\nCRITICAL: Output strictly valid JSON."
 
     payload = {
-        "contents": [{
-            "parts": [
-                {"text": prompt},
-                {"file_data": {"mime_type": mime_type, "file_uri": file_uri}}
-            ]
-        }],
-        "safetySettings": safety_settings,
-        "generationConfig": generation_config
+        "contents": [{"parts": [{"text": prompt}, {"file_data": {"mime_type": mime_type, "file_uri": file_uri}}]}],
+        "generationConfig": {
+            "temperature": 0.2, 
+            "maxOutputTokens": 8192,
+            "response_mime_type": "application/json" # Hints model to use JSON mode
+        }
     }
-
-    # RETRY LOOP FOR CONTENT
-    # Sometimes API returns 200 but empty content. We retry up to 3 times.
-    max_content_retries = 3
     
-    for attempt in range(max_content_retries):
+    for attempt in range(3):
         resp = make_request_with_retry("POST", api_url, json=payload, headers={"Content-Type": "application/json"})
+        if resp.status_code != 200: return f"API ERROR {resp.status_code}: {resp.text}"
         
-        if resp.status_code != 200:
-            logger.error("Transcription API returned %s: %s", resp.status_code, resp.text)
-            return f"API ERROR {resp.status_code}: {resp.text}"
-
         try:
             body = resp.json()
-        except ValueError:
-            return "PARSE ERROR: Non-JSON response from transcription API."
-
-        # Check for block reasons first
-        prompt_feedback = body.get("promptFeedback", {})
-        if prompt_feedback and prompt_feedback.get("blockReason"):
-            return f"BLOCKED: {prompt_feedback.get('blockReason')}"
-
-        # Check for valid candidates
-        candidates = body.get("candidates") or []
-        if candidates:
-            first = candidates[0]
-            content = first.get("content", {})
-            parts = content.get("parts", [])
-            if parts:
-                text = parts[0].get("text") or parts[0].get("content") or ""
-                if text.strip():
-                    return text # Return valid text immediately
-        
-        # If we reached here, response was 200 OK but had no content.
-        logger.warning(f"GenerateContent attempt {attempt+1}/{max_content_retries} empty. Retrying...")
-        time.sleep(2 * (attempt + 1)) # Backoff
-
-    return "NO TRANSCRIPT (Empty Response after retries)"
+            candidates = body.get("candidates") or []
+            if candidates:
+                text = candidates[0].get("content", {}).get("parts", [])[0].get("text", "")
+                if text.strip(): return text
+        except: pass
+        time.sleep(2 * (attempt + 1))
+    return "{}"
 
 
-# --- DATA PREPARATION LOGIC (ALL ROWS) ---
+# --- DATA PREPARATION ---
 
 def prepare_all_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Prepares the DataFrame for processing.
-    
-    LOGIC:
-    - Iterates through EVERY row.
-    - If recording_url exists -> Mark for TRANSCRIBE.
-    - If recording_url missing -> Mark for SKIP.
-    """
-    
-    if 'date' in df.columns:
-        df['date'] = pd.to_datetime(df['date'], errors='coerce')
-    
     final_rows = []
-
     for index, row in df.iterrows():
-        # Create a copy to avoid SettingWithCopy warnings
-        row_data = row.copy()
-        
-        # Check URL validity
-        url_val = row_data.get('recording_url')
-        
+        r = row.copy()
+        url_val = r.get('recording_url')
         if pd.notna(url_val) and str(url_val).strip() != "":
-            # Case A: Valid URL found -> Transcribe
-            row_data['processing_action'] = 'TRANSCRIBE'
-            row_data['status'] = 'Pending'
+            r['processing_action'] = 'TRANSCRIBE'
+            r['status'] = 'Pending'
         else:
-            # Case B: No URL -> Skip this specific row
-            row_data['processing_action'] = 'SKIP'
-            row_data['transcript'] = "⚠️ Skipped: No recording URL provided in this row."
-            row_data['status'] = '⚠️ Skipped'
-            row_data['error'] = 'Missing recording_url'
-        
-        final_rows.append(row_data)
-    
+            r['processing_action'] = 'SKIP'
+            r['transcript'] = "{}"
+            r['status'] = 'Skipped'
+        final_rows.append(r)
     return pd.DataFrame(final_rows).reset_index(drop=True)
 
 
-# --- WORKER / PROCESSING FUNCTION ---
+# --- WORKER ---
 
-def process_single_row(index: int, row: pd.Series, api_key: str, final_prompt: str, keep_remote: bool = False) -> Dict[str, Any]:
-    """
-    The worker function executed by ThreadPoolExecutor.
-    Uses the final prompt passed from the UI.
-    """
-    mobile = str(row.get("mobile_number", "Unknown"))
-    
-    # Initialize result structure
+def process_single_row(index: int, row: pd.Series, api_key: str, final_prompt: str, keep_remote: bool) -> Dict[str, Any]:
     result = {
-        "index": index,
-        "mobile_number": mobile,
-        "recording_url": row.get("recording_url"),
-        "transcript": row.get("transcript", ""), 
-        "status": row.get("status", "Pending"),
-        "error": row.get("error", None),
+        "index": index, "mobile_number": str(row.get("mobile_number", "Unknown")),
+        "recording_url": row.get("recording_url"), "transcript": row.get("transcript", ""),
+        "status": row.get("status", "Pending"), "error": row.get("error", None)
     }
+    if row.get("processing_action") == "SKIP": return result
 
-    # Check the flag set by the preparation logic
-    action = row.get("processing_action", "TRANSCRIBE")
-    
-    if action == "SKIP":
-        return result
-
-    # Validate URL (Double check before entering retry loop)
-    audio_url = row.get("recording_url")
-    if not audio_url or not isinstance(audio_url, str):
-        result.update({"status": "❌ Failed", "error": "Invalid URL"})
-        return result
-
-    # --- JOB-LEVEL RETRY LOOP ---
-    for worker_attempt in range(MAX_WORKER_RETRIES):
-        
-        tmp_path = None
-        file_info = None
-
+    for attempt in range(MAX_WORKER_RETRIES):
+        tmp_path, file_info = None, None
         try:
-            parsed = urlparse(audio_url)
-
-            # 1. Download file (streamed)
-            logger.info("Attempt %d: Downloading %s...", worker_attempt + 1, mobile)
-            r = make_request_with_retry("GET", audio_url, stream=True)
-            if r.status_code != 200:
-                raise Exception(f"Failed to download audio URL ({r.status_code})")
-
-            header_ct = r.headers.get("content-type", "")
-            ext, mime_type = detect_extension_and_mime(parsed.path, header_ct)
-
-            # Save to temp file
+            r = make_request_with_retry("GET", result["recording_url"], stream=True)
+            if r.status_code != 200: raise Exception(f"Download failed: {r.status_code}")
+            ext, mime = detect_extension_and_mime(urlparse(result["recording_url"]).path, r.headers.get("content-type"))
+            
             with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-                for chunk in r.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
-                    if chunk:
-                        tmp.write(chunk)
+                for chunk in r.iter_content(DOWNLOAD_CHUNK_SIZE): tmp.write(chunk)
                 tmp_path = tmp.name
-
-            file_size = os.path.getsize(tmp_path)
-
-            # 2. Upload to Google (Resumable)
-            logger.info("Attempt %d: Uploading %s (size: %d)...", worker_attempt + 1, mobile, file_size)
-            cleaned_mobile = "".join(ch for ch in mobile if ch.isalnum())
-            unique_name = f"rec_{cleaned_mobile}_{int(time.time())}_{random.randint(100,999)}{ext}"
-
-            upload_url = initiate_upload(api_key, unique_name, mime_type, file_size)
-            file_info = upload_bytes(upload_url, tmp_path, mime_type)
-
-            # 3. Wait for Processing
-            logger.info("Attempt %d: Waiting for active status for %s...", worker_attempt + 1, mobile)
+            
+            unique_name = f"rec_{index}_{int(time.time())}_{random.randint(100,999)}{ext}"
+            up_url = initiate_upload(api_key, unique_name, mime, os.path.getsize(tmp_path))
+            file_info = upload_bytes(up_url, tmp_path, mime)
+            
             wait_for_active(api_key, file_info["name"])
-
-            # 4. Transcribe (using user provided prompt)
-            logger.info("Attempt %d: Transcribing %s...", worker_attempt + 1, mobile)
-            transcript = generate_transcript(api_key, file_info["uri"], mime_type, final_prompt)
+            
+            # GENERATE
+            transcript = generate_transcript(api_key, file_info["uri"], mime, final_prompt)
             result["transcript"] = transcript
             
-            # Check for API-level errors in the text response
-            if "API ERROR" in transcript or "PARSE ERROR" in transcript or "BLOCKED" in transcript:
+            if "API ERROR" in transcript:
+                if attempt < MAX_WORKER_RETRIES - 1: raise Exception("API Error")
                 result["status"] = "❌ Error"
-                # Raise an exception here to trigger retry, unless this is the final attempt
-                if worker_attempt < MAX_WORKER_RETRIES - 1:
-                    raise Exception(f"Transcription error: {transcript}")
-            elif "NO TRANSCRIPT" in transcript:
-                result["status"] = "❌ Empty"
-                # Raise an exception here to trigger retry
-                if worker_attempt < MAX_WORKER_RETRIES - 1:
-                    raise Exception(f"Empty transcript response after retries.")
             else:
                 result["status"] = "✅ Success"
-                # Success! Break the worker retry loop and return the result
                 return result
 
         except Exception as e:
-            # If the exception occurred during the final attempt, log and save the error.
-            if worker_attempt == MAX_WORKER_RETRIES - 1:
-                logger.exception("Final processing attempt failed for %s: %s", mobile, str(e))
-                result["transcript"] = f"SYSTEM ERROR: {str(e)}"
-                result["status"] = "❌ Failed"
-                result["error"] = str(e)
+            if attempt == MAX_WORKER_RETRIES - 1:
+                result["status"], result["error"] = "❌ Failed", str(e)
             else:
-                # Transient error, log and prepare for retry
-                logger.warning("Transient worker failure for %s (attempt %d). Retrying after backoff: %s", mobile, worker_attempt + 1, str(e))
-                _sleep_with_jitter(WORKER_BACKOFF_BASE, worker_attempt)
-
+                _sleep_with_jitter(WORKER_BACKOFF_BASE, attempt)
         finally:
-            # Ensure local temp file is deleted after each attempt
-            if tmp_path and os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except Exception as e:
-                    logger.warning("Failed to remove tmp file %s: %s", tmp_path, str(e))
-            
-            # Ensure remote file is deleted after each attempt (unless keeping for debug)
-            if file_info and isinstance(file_info, dict) and file_info.get("name") and not keep_remote:
-                try:
-                    delete_file(api_key, file_info["name"])
-                except Exception:
-                    pass
-
-    # If the loop finishes without returning (i.e., all attempts failed)
+            if tmp_path and os.path.exists(tmp_path): os.remove(tmp_path)
+            if file_info and not keep_remote: delete_file(api_key, file_info["name"])
     return result
 
 
-# --- RESULT MERGING & DISPLAY UTILS ---
+# --- UI & DASHBOARD UTILS ---
 
-def merge_results_with_original(df_consolidated: pd.DataFrame, processed_results: list) -> pd.DataFrame:
+def aggressive_json_parse(text: str) -> Optional[Dict]:
     """
-    Merges the worker results back into the consolidated DataFrame.
+    Finds the first '{' and last '}' to strip out markdown/preamble.
     """
-    # Sort results by index to match original DF order
-    results_df = pd.DataFrame(sorted(processed_results, key=lambda r: r["index"]))
-    
-    # Define columns to update
-    cols_to_update = ["transcript", "status", "error"]
-    
-    # Drop these columns from the base DF if they exist (to avoid _x / _y suffixes)
-    df_base = df_consolidated.drop(columns=[c for c in cols_to_update if c in df_consolidated.columns])
-    
-    # Merge based on the preserved index
-    merged = df_base.merge(results_df[["index"] + cols_to_update], left_index=True, right_on="index", how="left")
-    
-    # Clean up the index column
-    if "index" in merged.columns:
-        merged = merged.drop(columns=["index"])
-    
-    return merged
-
-def colorize_transcript_html(text: str) -> str:
-    """
-    Format transcript text into color-coded HTML.
-    """
-    if not isinstance(text, str) or not text.strip():
-        return "<div class='other-speech'>No transcript</div>"
-
-    lines = text.splitlines()
-    html_output = ""
-    
-    for line in lines:
-        clean = line.strip()
-        if not clean: continue
-        
-        escaped_line = html.escape(clean)
-        lc = clean.lower()
-        
-        if "speaker 1:" in lc:
-            html_output += f"<div class='speaker1'>{escaped_line}</div>"
-        elif "speaker 2:" in lc:
-            html_output += f"<div class='speaker2'>{escaped_line}</div>"
-        else:
-            html_output += f"<div class='other-speech'>{escaped_line}</div>"
-            
-    return f"<div>{html_output}</div>"
-
-
-# --- DYNAMIC DASHBOARD RENDERER (NEW) ---
-
-def extract_json_safe(text: str) -> Optional[Dict]:
-    """Extracts JSON object from text, handling markdown fences."""
+    if not text: return None
     try:
-        # 1. Attempt strict match first
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if match:
-            return json.loads(match.group())
-        # 2. Attempt cleanup if strict match failed but text looks like JSON
-        cleaned = text.strip()
-        if cleaned.startswith("```json"):
-            cleaned = cleaned.replace("```json", "").replace("```", "")
-        return json.loads(cleaned)
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1:
+            json_str = text[start : end + 1]
+            return json.loads(json_str)
+        return None
     except:
         return None
 
-def render_dynamic_dashboard(data: Dict):
-    """
-    Dynamically renders metrics found in the JSON output.
-    Does not rely on hardcoded keys. Adapts to new sections automatically.
-    """
-    # --- 1. OVERALL STATUS BANNER ---
+def render_dashboard_card(data: Dict):
+    # 1. Overall Status
     status = data.get("overall_status", "UNKNOWN")
     if status == "PASS":
         st.success(f"### Overall Status: {status} ✅")
@@ -621,26 +310,25 @@ def render_dynamic_dashboard(data: Dict):
     else:
         st.info(f"### Overall Status: {status}")
 
-    # --- 2. DYNAMIC SCORES GRID ---
+    # 2. Metrics Grid
     scores = data.get("scores", {})
     if scores:
         st.markdown("#### 📊 Performance Metrics")
         
-        # Helper to chunk dictionary items into rows of 4
-        def chunked(it, size):
-            it = iter(it)
-            while True:
-                p = tuple(next(it) for _ in range(size))
-                if not p: break
-                yield p
+        # Generator to split dict into chunks of 4
+        items = list(scores.items())
+        chunks = [items[i:i + 4] for i in range(0, len(items), 4)]
 
-        for chunk in chunked(scores.items(), 4):
+        for chunk in chunks:
             cols = st.columns(len(chunk))
             for i, (key, details) in enumerate(chunk):
                 with cols[i]:
                     val = details.get("score", 0)
                     conf = details.get("confidence_score", 0)
-                    color = "#28a745" if val >= 0.8 else "#ffc107" if val >= 0.5 else "#dc3545" # Green, Yellow, Red
+                    
+                    # Dynamic Color Logic
+                    color = "#28a745" if val >= 0.8 else "#ffc107" if val >= 0.5 else "#dc3545"
+                    
                     st.markdown(
                         f"""
                         <div class="metric-box">
@@ -651,306 +339,143 @@ def render_dynamic_dashboard(data: Dict):
                         """, 
                         unsafe_allow_html=True
                     )
-    
+
     st.divider()
 
-    # --- 3. REASONING EXPANDERS ---
+    # 3. Reasoning
     st.markdown("#### 📝 Detailed Reasoning")
     if scores:
         for key, details in scores.items():
             s_val = details.get("score", 0)
             icon = "🟢" if s_val >= 0.8 else "🔴" if s_val < 0.5 else "🟡"
-            with st.expander(f"{icon} {key.replace('_', ' ').title()} Details"):
+            
+            with st.expander(f"{icon} {key.replace('_', ' ').title()}"):
                 st.write(f"**Reasoning:** {details.get('reasoning', 'No reasoning provided.')}")
                 ts = details.get("timestamp_of_issue")
-                if ts:
-                    st.warning(f"⚠️ Timestamp of Issue: **{ts}**")
+                if ts: st.warning(f"⚠️ Issue Timestamp: **{ts}**")
 
-# --- DEFAULT PROMPT TEMPLATE (ORIGINAL DIARIZATION) ---
-DEFAULT_PROMPT_TEMPLATE = """Transcribe this call in {language} exactly as spoken.
+# --- DEFAULT JSON PROMPT ---
+DEFAULT_AUDIT_PROMPT = """Analyze this call recording for Quality Assurance.
 
-CRITICAL REQUIREMENTS — FOLLOW STRICTLY:
-1. EVERY line MUST start with exactly one of these labels:
-   - Speaker 1:
-   - Speaker 2:
-2. NEVER merge dialogue from two speakers in one line.
-3. If you are unsure who is speaking, GUESS — but DO NOT leave the speaker label blank.
-4. If the call sounds like a single-person monologue, STILL label every line as:
-   Speaker 1: <text>
-5. Do NOT summarize or improve the language. Write EXACTLY what was said.
-6. Maintain natural turn-taking and break lines whenever the speaker changes.
-
-TIMESTAMP RULES:
-- Add timestamps at the start of EVERY line.
-- Format MUST be: [0ms-2500ms]
-- Use raw milliseconds only.
-- No mm:ss format allowed.
-
-LANGUAGE RULES:
-- ALL Hindi words must be written in Hinglish (Latin script).
-- NO Devanagari characters anywhere.
-- English words should remain English.
-
-STRICT FORMAT (DO NOT IGNORE):
-- [timestamp] Speaker X: line of dialogue
-- Only one speaker per line.
-- Only one utterance per line.
-- If two people speak at the same time, split into two separate lines with separate timestamps.
-
-AUTO-CORRECTION:
-- If any line is missing the speaker label, FIX IT and assign Speaker 1 or Speaker 2 based on your best guess.
-- Do NOT output any unlabeled lines.
-
-Return ONLY the transcript. No explanation.
+OUTPUT FORMAT (STRICT JSON):
+{
+  "scores": {
+    "latency": {
+      "score": <float 0.0-1.0>,
+      "confidence_score": <float 0.0-1.0>,
+      "timestamp_of_issue": "mm:ss",
+      "reasoning": "..."
+    },
+    "repetition": { ... },
+    "politeness": { ... },
+    "hallucination": { ... },
+    "language": { ... },
+    "interruption_handling": { ... }
+  },
+  "overall_status": "PASS" or "FAIL"
+}
 """
 
-# --- MAIN APPLICATION ENTRY POINT ---
+# --- MAIN APP ---
 
 def main():
-    # Initialize Session State
-    if "processed_results" not in st.session_state:
-        st.session_state.processed_results = []
-    if "final_df" not in st.session_state:
-        st.session_state.final_df = pd.DataFrame()
+    if "processed_results" not in st.session_state: st.session_state.processed_results = []
+    if "final_df" not in st.session_state: st.session_state.final_df = pd.DataFrame()
 
-    # --- SIDEBAR CONFIG ---
     with st.sidebar:
-        st.header("Configuration")
+        st.header("⚙️ Settings")
         api_key = st.text_input("Gemini API Key", type="password")
-        
-        # Concurrency slider
-        max_workers = st.slider("Concurrency (Threads)", min_value=1, max_value=128, value=4,
-                                help="Higher = faster but may hit API rate limits.")
-        
-        keep_remote = st.checkbox("Keep audio on Google", value=False,
-                                help="For debugging: prevents auto-deletion of files from Gemini.")
+        max_workers = st.slider("Concurrency", 1, 128, 4)
+        keep_remote = st.checkbox("Keep Google Files", False)
         
         st.divider()
+        language_mode = st.selectbox("Language", ["English", "Hindi", "Hinglish"], index=2)
         
-        language_mode = st.selectbox("Language", ["English (India)", "Hindi", "Mixed (Hinglish)"], index=2)
-        lang_map = {
-            "English (India)": "English (Indian accent)",
-            "Hindi": "Hindi (Devanagari)",
-            "Mixed (Hinglish)": "Mixed English and Hindi"
-        }
-        
-        # --- EDITABLE PROMPT SECTION ---
-        with st.expander("⚙️ Advanced: Edit System Prompt"):
-            st.caption("Instructions sent to Gemini. {language} will be replaced by your selection above.")
-            prompt_input = st.text_area(
-                "System Prompt", 
-                value=DEFAULT_PROMPT_TEMPLATE, 
-                height=300
-            )
-            st.info("Tip: If you paste a JSON Prompt here, the Dashboard will automatically visualize it!")
-
         st.divider()
-        theme_choice = st.radio("Theme", options=["Light", "Dark"], index=0, horizontal=True)
-        st.caption("Use Dark theme if you prefer low-light UI.")
+        theme_choice = st.radio("Theme", ["Light", "Dark"], 0, horizontal=True)
 
-    # Apply Theme Class
     theme_class = "dark-theme" if theme_choice == "Dark" else "light-theme"
     st.markdown(f"<div class='{theme_class}'>", unsafe_allow_html=True)
 
-
-    # --- FILE UPLOADER (MULTI-FILE) ---
-    st.write("### 📂 Upload Call Data")
-    uploaded_files = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"], accept_multiple_files=True)
-
-    # Status Containers
-    progress_bar = st.empty()
-    status_text = st.empty()
-    result_placeholder = st.empty()
-
-    start_button = st.button("🚀 Start Batch Processing (All Rows)", type="primary")
-
-
-    # --- PROCESSING LOGIC ---
-    if start_button:
-        # Validation
-        if not api_key:
-            st.error("Please enter your Gemini API Key in the sidebar.")
-            st.stop()
-        
-        if not uploaded_files:
-            st.error("Please upload at least one Excel file.")
-            st.stop()
-
-        # 1. READ AND CONCATENATE FILES
-        all_dfs = []
-        for file in uploaded_files:
-            try:
-                df_single = pd.read_excel(file)
-                all_dfs.append(df_single)
-            except Exception as e:
-                st.warning(f"Skipping file {file.name}: Error reading file: {e}")
-                continue
-
-        if not all_dfs:
-            st.error("No valid Excel files could be read.")
-            st.stop()
-
-        # Combine into one Master DataFrame
-        # ignore_index=True ensures a clean 0..N index
-        raw_df = pd.concat(all_dfs, ignore_index=True)
-
-        # Check for required columns
-        required_cols = ["recording_url", "mobile_number"] 
-        missing_cols = [c for c in required_cols if c not in raw_df.columns]
-        if missing_cols:
-            st.error(f"Missing required columns in dataset: {', '.join(missing_cols)}")
-            st.stop()
-
-        # 2. PREPARE DATA (ALL ROWS)
-        status_text.info("Preparing data for processing (Checking every row)...")
-        
-        # This function marks every row for transcription or skipping based on URL presence
-        df_processed_ready = prepare_all_rows(raw_df)
-        
-        # Prepare for Processing
-        selected_language_str = lang_map[language_mode]
-        # Inject user selection into the custom prompt
-        final_prompt_to_use = prompt_input.replace("{language}", selected_language_str)
-        
-        total_rows = len(df_processed_ready)
-        
-        status_text.info(f"Processing {total_rows} items with {max_workers} threads...")
-        progress_bar.progress(0.0)
-
-        # Reset session state for new run
-        processed_results = []
-        st.session_state.processed_results = []
-
-        # 3. THREAD POOL EXECUTION
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all jobs
-            futures = {
-                executor.submit(process_single_row, idx, row, api_key, final_prompt_to_use, keep_remote): idx
-                for idx, row in df_processed_ready.iterrows()
-            }
-
-            completed = 0
-            for future in as_completed(futures):
-                res = future.result()
-                processed_results.append(res)
-                completed += 1
-                
-                # Update UI
-                progress_bar.progress(completed / total_rows)
-                status_text.markdown(f"Processed **{completed}/{total_rows}** items.")
-                
-                # Live Preview (Last 5 items)
-                recent_results = sorted(processed_results, key=lambda r: r["index"])[-5:]
-                preview_df = pd.DataFrame(recent_results)
-                if not preview_df.empty:
-                    result_placeholder.dataframe(
-                        preview_df[["mobile_number", "status", "transcript"]], 
-                        width=800,
-                        hide_index=True
-                    )
-
-        # 4. FINAL MERGE
-        final_df = merge_results_with_original(df_processed_ready, processed_results)
-        st.session_state.final_df = final_df
-        
-        status_text.success("Batch Processing Complete!")
-
-
-    # --- RESULTS VIEWER ---
-    final_df = st.session_state.final_df
-
-    if not final_df.empty:
-        st.markdown("<hr/>", unsafe_allow_html=True)
-        st.markdown("## 🎛️ Transcript & Audit Browser")
-
-        # Filters Layout
-        col_a, col_b, col_c, col_d = st.columns([3, 1, 1, 1])
-        with col_a:
-            search_q = st.text_input("Search", placeholder="Search transcript, JSON, phone, or URL...")
-        with col_b:
-            status_sel = st.selectbox("Status", ["All", "Success", "Failed", "Skipped"])
-        with col_c:
-            speaker_sel = st.selectbox("Speaker", ["All", "Speaker 1", "Speaker 2"])
-        with col_d:
-            per_page = st.selectbox("Per page", [5, 10, 20, 50], index=1)
-
-        # Apply Filters
-        view_df = final_df.copy()
-        
-        if status_sel != "All":
-            if status_sel == "Success":
-                view_df = view_df[view_df["status"].str.contains("Success", case=False, na=False)]
-            elif status_sel == "Failed":
-                view_df = view_df[view_df["status"].str.contains("Failed|Error|Empty", case=False, na=False)]
-            elif status_sel == "Skipped":
-                view_df = view_df[view_df["status"].str.contains("Skipped", case=False, na=False)]
-
-        if search_q.strip():
-            q = search_q.lower()
-            mask = (
-                view_df["transcript"].fillna("").str.lower().str.contains(q) |
-                view_df["mobile_number"].astype(str).str.lower().str.contains(q) |
-                view_df["recording_url"].astype(str).str.lower().str.contains(q)
-            )
-            view_df = view_df[mask]
-
-        if speaker_sel != "All":
-            key = "speaker 1" if speaker_sel == "Speaker 1" else "speaker 2"
-            mask = view_df["transcript"].fillna("").str.lower().str.contains(key)
-            view_df = view_df[mask]
-
-        total_items = len(view_df)
-        st.markdown(f"**Showing {total_items} result(s)**")
-
-        # Pagination Logic
-        pages = max(1, math.ceil(total_items / per_page))
-        page_idx = st.number_input("Page", min_value=1, max_value=pages, value=1, step=1)
-        start = (page_idx - 1) * per_page
-        end = start + per_page
-        page_df = view_df.iloc[start:end]
-
-        # Excel Download Button
-        out_buf = BytesIO()
-        view_df.to_excel(out_buf, index=False)
-        st.download_button(
-            "📥 Download Filtered Results",
-            data=out_buf.getvalue(),
-            file_name=f"transcripts_export_{int(time.time())}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    # --- MAIN PAGE HEADER & PROMPT EDITOR ---
+    st.title("🤖 QA Call Auditor")
+    
+    with st.expander("📝 Edit System Prompt (Instructions)", expanded=True):
+        prompt_input = st.text_area(
+            "System Prompt", 
+            value=DEFAULT_AUDIT_PROMPT, 
+            height=250,
+            help="Define your JSON structure here. The dashboard will adapt automatically."
         )
 
-        # Render Individual Cards
-        for idx, row in page_df.iterrows():
-            mobile_display = row.get('mobile_number', 'Unknown')
-            status_display = row.get('status', '')
-            header = f"{mobile_display} — {status_display}"
-            
-            with st.expander(header, expanded=False):
-                # Metadata Row
-                url_val = html.escape(str(row.get('recording_url', 'None')))
-                meta_html = f"<div class='meta-row'><b>URL:</b> {url_val}</div>"
-                st.markdown(meta_html, unsafe_allow_html=True)
+    st.write("### 📂 Upload Excel Batch")
+    uploaded_files = st.file_uploader("Select .xlsx files", type=["xlsx"], accept_multiple_files=True)
+
+    # Progress Area
+    progress_bar = st.empty()
+    status_text = st.empty()
+    
+    if st.button("🚀 Start Audit Batch", type="primary"):
+        if not api_key: st.error("Please enter API Key in sidebar."); st.stop()
+        if not uploaded_files: st.error("Please upload files."); st.stop()
+        
+        all_dfs = [pd.read_excel(f) for f in uploaded_files]
+        raw_df = pd.concat(all_dfs, ignore_index=True)
+        if "recording_url" not in raw_df.columns: st.error("Missing 'recording_url' column."); st.stop()
+
+        df_ready = prepare_all_rows(raw_df)
+        final_prompt = prompt_input + f"\n\nContext Language: {language_mode}"
+        
+        st.session_state.processed_results = []
+        status_text.info(f"Auditing {len(df_ready)} calls...")
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(process_single_row, idx, row, api_key, final_prompt, keep_remote): idx for idx, row in df_ready.iterrows()}
+            completed = 0
+            for future in as_completed(futures):
+                st.session_state.processed_results.append(future.result())
+                completed += 1
+                progress_bar.progress(completed / len(df_ready))
+                status_text.markdown(f"**Processed {completed}/{len(df_ready)}**")
+
+        st.session_state.final_df = pd.DataFrame(st.session_state.processed_results)
+        status_text.success("Batch Complete!")
+
+    # --- DASHBOARD RESULTS ---
+    df = st.session_state.final_df
+    if not df.empty:
+        st.markdown("## 📊 Audit Results")
+        
+        # Search & Filter
+        c1, c2, c3 = st.columns([3, 1, 1])
+        q = c1.text_input("Search JSON/Phone...")
+        stat = c2.selectbox("Filter", ["All", "Success", "Failed"])
+        
+        view = df.copy()
+        if stat == "Success": view = view[view["status"].str.contains("Success")]
+        if stat == "Failed": view = view[view["status"].str.contains("Error|Failed")]
+        if q: view = view[view.astype(str).apply(lambda x: x.str.contains(q, case=False)).any(axis=1)]
+
+        # Download
+        buf = BytesIO()
+        view.to_excel(buf, index=False)
+        st.download_button("📥 Download Excel Report", buf.getvalue(), "audit_report.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        # RENDER CARDS
+        for i, row in view.iterrows():
+            with st.expander(f"📞 {row.get('mobile_number')} | {row.get('status')}"):
+                st.markdown(f"**URL:** [{row.get('recording_url')}]({row.get('recording_url')})")
                 
-                # --- HYBRID VIEWER LOGIC ---
-                transcript_text = row.get("transcript", "")
-                
-                # 1. Attempt to detect JSON (QA Dashboard Mode)
-                json_data = extract_json_safe(transcript_text)
+                raw_txt = row.get("transcript", "")
+                json_data = aggressive_json_parse(raw_txt)
                 
                 if json_data:
-                    # RENDER DASHBOARD
-                    render_dynamic_dashboard(json_data)
-                    # Also provide option to see raw text
-                    with st.expander("Show Raw JSON Output"):
-                        st.code(transcript_text, language="json")
+                    render_dashboard_card(json_data)
+                    with st.expander("View Raw JSON"):
+                        st.code(raw_txt, language="json")
                 else:
-                    # RENDER STANDARD TRANSCRIPT (Old App Style)
-                    transcript_html = colorize_transcript_html(transcript_text)
-                    st.markdown(f"<div class='transcript-box'>{transcript_html}</div>", unsafe_allow_html=True)
-                
-                # Error display if present
-                if row.get("error"):
-                    st.error(f"Error: {row.get('error')}")
+                    st.warning("Could not parse JSON. Raw Output:")
+                    st.code(raw_txt)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
