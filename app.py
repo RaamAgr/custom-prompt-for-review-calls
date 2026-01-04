@@ -1,10 +1,8 @@
-# app.py — FINAL FIXED VERSION
+# app.py — FIXED COMPLETE VERSION
 # -----------------------------------------------------------------------------
-# FEATURES:
-# 1. PROMPT EDITOR ON MAIN PAGE (Verified).
-# 2. QA Dashboard (Visual metrics).
-# 3. Aggressive JSON Parsing.
-# 4. Full Concurrency & Retries.
+# 1. Prompt Editor is on the MAIN PAGE (Verified indentation).
+# 2. Sidebar contains ONLY Settings (API Key, Concurrency).
+# 3. No code cuts.
 # -----------------------------------------------------------------------------
 
 import streamlit as st
@@ -23,7 +21,7 @@ from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Dict, Any
 
-# --- 1. PAGE CONFIG ---
+# --- 1. PAGE CONFIG (Must be first) ---
 st.set_page_config(page_title="QA Auditor", layout="wide")
 
 # --- CONFIGURATION ---
@@ -322,16 +320,23 @@ def main():
     theme_class = "dark-theme" if theme_choice == "Dark" else "light-theme"
     st.markdown(f"<div class='{theme_class}'>", unsafe_allow_html=True)
 
-    # --- MAIN PAGE CONTENT ---
+    # --- MAIN PAGE CONTENT (OUTSIDE SIDEBAR) ---
     st.title("🤖 QA Call Auditor")
     
-    # 1. PROMPT EDITOR (Explicitly here on main page)
+    # 1. PROMPT EDITOR
     st.markdown("### 📝 Edit System Prompt")
-    st.caption("Define your JSON structure here. The dashboard will adapt automatically.")
-    prompt_input = st.text_area("System Prompt Input", value=DEFAULT_AUDIT_PROMPT, height=250, label_visibility="collapsed")
+    st.caption("Define your strict JSON structure here.")
+    
+    # THIS TEXT AREA IS NOW ON THE MAIN PAGE
+    prompt_input = st.text_area(
+        "System Prompt Input", 
+        value=DEFAULT_AUDIT_PROMPT, 
+        height=250, 
+        label_visibility="collapsed"
+    )
 
     # 2. File Upload
-    st.markdown("### 📂 Upload Excel Batch")
+    st.write("### 📂 Upload Excel Batch")
     uploaded_files = st.file_uploader("Select .xlsx files", type=["xlsx"], accept_multiple_files=True)
 
     progress_bar = st.empty()
