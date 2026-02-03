@@ -1,13 +1,13 @@
-# app.py — COMPLETE BATCH TRANSCRIBER (ALL ROWS + EDITABLE PROMPT)
+# app.py — COMPLETE BATCH TRANSCRIBER (FAST FAIL + REAL-TIME SAVE)
 # -----------------------------------------------------------------------------
 # FEATURES INCLUDED:
 # 1. Multi-file Excel Upload (Merges multiple files).
-# 2. Robust Gemini API Integration (Resumable Uploads, Polling, Retries).
+# 2. Robust Gemini API Integration (Resumable Uploads).
 # 3. PROCESSES EVERY ROW (No unique mobile number filtering).
-# 4. Empty Response Retry (Retries Gemini API if it returns empty text).
+# 4. FAIL FAST: No retries on error or empty response.
 # 5. High Concurrency (Slider up to 128 workers).
-# 6. Job-Level Retry (Retries the full sequence on transient failure).
-# 7. NEW: Editable System Prompt in UI.
+# 6. REAL-TIME SAVE: Updates results instantly (safe to stop mid-way).
+# 7. Editable System Prompt in UI.
 # -----------------------------------------------------------------------------
 
 import streamlit as st
@@ -36,8 +36,8 @@ MODEL_NAME = "gemini-3-flash-preview"
 DOWNLOAD_CHUNK_SIZE = 8192
 
 # Job-level retry configuration
-MAX_WORKER_RETRIES = 3 # Number of attempts per row (initial + 2 retries)
-WORKER_BACKOFF_BASE = 2 # Base seconds for backoff (5s, 10s, 20s)
+MAX_WORKER_RETRIES = 1  # <--- CHANGED: 1 attempt only (No retries)
+WORKER_BACKOFF_BASE = 0.5 # <--- CHANGED: Faster fail
 
 # Configure logging to console
 logging.basicConfig(
@@ -135,7 +135,7 @@ def make_request_with_retry(method: str, url: str, max_retries: int = 5, backoff
             logger.warning("RequestException on %s %s: %s (attempt %d)", method, url, str(e), attempt + 1)
             last_exc = e
             _sleep_with_jitter(backoff_base, attempt)
-      
+       
     # All retries exhausted
     if last_exc:
         raise last_exc
@@ -249,9 +249,10 @@ def upload_bytes(upload_url: str, file_path: str, mime_type: str) -> Dict[str, A
 
 # --- GOOGLE FILE STATUS POLLING ---
 
-def wait_for_active(api_key: str, file_name: str, timeout_seconds: int = 300) -> bool:
+def wait_for_active(api_key: str, file_name: str, timeout_seconds: int = 60) -> bool:
     """
     Polls the file status endpoint until state is ACTIVE or FAILED.
+    CHANGED: Timeout reduced to 60s to fail fast.
     """
     url = f"{BASE_URL}/v1beta/{file_name}?key={api_key}"
     start = time.time()
@@ -293,7 +294,7 @@ def delete_file(api_key: str, file_name: str):
 def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str) -> str:
     """
     Calls Gemini v1beta generateContent to transcribe the audio.
-    INCLUDES RETRY LOGIC for empty responses.
+    CHANGED: No retries on empty response.
     """
     api_url = f"{BASE_URL}/v1beta/models/{MODEL_NAME}:generateContent?key={api_key}"
 
@@ -319,8 +320,8 @@ def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str
     }
 
     # RETRY LOOP FOR CONTENT
-    # Sometimes API returns 200 but empty content. We retry up to 3 times.
-    max_content_retries = 3
+    # CHANGED: Set to 1 to stop retrying.
+    max_content_retries = 1
     
     for attempt in range(max_content_retries):
         resp = make_request_with_retry("POST", api_url, json=payload, headers={"Content-Type": "application/json"})
@@ -351,10 +352,10 @@ def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str
                     return text # Return valid text immediately
         
         # If we reached here, response was 200 OK but had no content.
-        logger.warning(f"GenerateContent attempt {attempt+1}/{max_content_retries} empty. Retrying...")
-        time.sleep(2 * (attempt + 1)) # Backoff
+        logger.warning(f"GenerateContent attempt {attempt+1}/{max_content_retries} empty.")
+        # No backoff here since we only try once now.
 
-    return "NO TRANSCRIPT (Empty Response after retries)"
+    return "NO TRANSCRIPT (Empty Response)"
 
 
 # --- DATA PREPARATION LOGIC (ALL ROWS) ---
@@ -475,14 +476,14 @@ def process_single_row(index: int, row: pd.Series, api_key: str, final_prompt: s
             # Check for API-level errors in the text response
             if "API ERROR" in transcript or "PARSE ERROR" in transcript or "BLOCKED" in transcript:
                 result["status"] = "❌ Error"
-                # Raise an exception here to trigger retry, unless this is the final attempt
+                # Raise an exception here to trigger retry (if enabled)
                 if worker_attempt < MAX_WORKER_RETRIES - 1:
                     raise Exception(f"Transcription error: {transcript}")
             elif "NO TRANSCRIPT" in transcript:
                 result["status"] = "❌ Empty"
-                # Raise an exception here to trigger retry
+                # Raise an exception here to trigger retry (if enabled)
                 if worker_attempt < MAX_WORKER_RETRIES - 1:
-                    raise Exception(f"Empty transcript response after retries.")
+                    raise Exception(f"Empty transcript response.")
             else:
                 result["status"] = "✅ Success"
                 # Success! Break the worker retry loop and return the result
@@ -751,9 +752,10 @@ def main():
                         hide_index=True
                     )
 
-        # 4. FINAL MERGE
-        final_df = merge_results_with_original(df_processed_ready, processed_results)
-        st.session_state.final_df = final_df
+                # --- REAL-TIME SAVE ---
+                # Update the main DF every time a row finishes.
+                # If user stops midway, st.session_state.final_df is already populated.
+                st.session_state.final_df = merge_results_with_original(df_processed_ready, processed_results)
         
         status_text.success("Batch Processing Complete!")
 
