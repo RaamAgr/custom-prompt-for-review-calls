@@ -1,12 +1,12 @@
-# app.py — BATCH TRANSCRIBER (RESUME SUPPORT + FAIL FAST)
+# app.py — COMPLETE BATCH TRANSCRIBER (ROBUST + RESUME + LIVE VIEW)
 # -----------------------------------------------------------------------------
 # FEATURES INCLUDED:
 # 1. Multi-file Excel Upload (Merges multiple files).
 # 2. Robust Gemini API Integration (Resumable Uploads).
-# 3. FAIL FAST: No retries on error or empty response.
-# 4. RESUME CAPABILITY: Detects processed rows and skips them.
-# 5. REAL-TIME SAVE: Updates results instantly.
-# 6. Persistent Results Viewer: Visible even after stopping.
+# 3. FAIL FAST: No retries on error or empty response (Configured per request).
+# 4. RESUME CAPABILITY: Automatically detects processed rows and lets you continue.
+# 5. LIVE TABLE VIEW: Shows the full results table updating in real-time.
+# 6. SAFE STOP: Use the browser "Stop" button; data is saved instantly.
 # -----------------------------------------------------------------------------
 
 import streamlit as st
@@ -35,7 +35,7 @@ MODEL_NAME = "gemini-3-flash-preview"
 DOWNLOAD_CHUNK_SIZE = 8192
 
 # Job-level retry configuration
-MAX_WORKER_RETRIES = 1  
+MAX_WORKER_RETRIES = 1  # 1 attempt only (Fail Fast)
 WORKER_BACKOFF_BASE = 0.5 
 
 # Configure logging to console
@@ -49,46 +49,26 @@ logger = logging.getLogger("transcriber")
 # --- UI STYLING (CSS) ---
 BASE_CSS = """
 <style>
-/* Card look for transcript entries */
 .call-card {
     border: 1px solid var(--border-color, #e6e6e6);
-    border-radius: 10px;
-    padding: 12px;
-    margin-bottom: 12px;
-    background: var(--card-bg, #fff);
-    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    border-radius: 10px; padding: 12px; margin-bottom: 12px;
+    background: var(--card-bg, #fff); box-shadow: 0 1px 3px rgba(0,0,0,0.04);
 }
-
-/* Transcript scroll area */
 .transcript-box {
-    max-height: 320px;
-    overflow: auto;
-    padding: 8px;
-    border-radius: 6px;
-    background: var(--transcript-bg, #fafafa);
-    border: 1px solid var(--border-color, #eee);
-    font-family: monospace;
-    white-space: pre-wrap; 
+    max-height: 320px; overflow: auto; padding: 8px; border-radius: 6px;
+    background: var(--transcript-bg, #fafafa); border: 1px solid var(--border-color, #eee);
+    font-family: monospace; white-space: pre-wrap; 
 }
-
 .speaker1 { color: #1f77b4; font-weight: 600; display: block; margin-bottom: 4px; }
 .speaker2 { color: #d62728; font-weight: 600; display: block; margin-bottom: 4px; }
 .other-speech { color: #333; display: block; margin-bottom: 4px; }
 .meta-row { font-size: 13px; color: var(--meta-color, #666); margin-bottom: 8px; }
 
 .dark-theme {
-    --card-bg: #0f1115;
-    --transcript-bg: #0b0c0f;
-    --border-color: #222428;
-    --meta-color: #9aa0a6;
-    color: #e6eef3;
+    --card-bg: #0f1115; --transcript-bg: #0b0c0f; --border-color: #222428; --meta-color: #9aa0a6; color: #e6eef3;
 }
 .light-theme {
-    --card-bg: #ffffff;
-    --transcript-bg: #fafafa;
-    --border-color: #e6e6e6;
-    --meta-color: #666666;
-    color: #111;
+    --card-bg: #ffffff; --transcript-bg: #fafafa; --border-color: #e6e6e6; --meta-color: #666666; color: #111;
 }
 </style>
 """
@@ -115,11 +95,11 @@ def make_request_with_retry(method: str, url: str, max_retries: int = 5, backoff
                 continue
             return resp
         except requests.exceptions.RequestException as e:
-            logger.warning("RequestException on %s: %s (attempt %d)", method, str(e), attempt + 1)
+            logger.warning("RequestException: %s (attempt %d)", str(e), attempt + 1)
             last_exc = e
             _sleep_with_jitter(backoff_base, attempt)
     if last_exc: raise last_exc
-    raise Exception("make_request_with_retry: retries exhausted")
+    raise Exception("Retries exhausted")
 
 
 # --- MIME TYPE & FILE EXTENSION HANDLING ---
@@ -150,10 +130,8 @@ def initiate_upload(api_key: str, display_name: str, mime_type: str, file_size: 
     url = f"{UPLOAD_URL}?uploadType=resumable&key={api_key}"
     headers = {
         "Content-Type": "application/json; charset=UTF-8",
-        "X-Goog-Upload-Protocol": "resumable",
-        "X-Goog-Upload-Command": "start",
-        "X-Goog-Upload-Header-Content-Length": str(file_size),
-        "X-Goog-Upload-Header-Content-Type": mime_type,
+        "X-Goog-Upload-Protocol": "resumable", "X-Goog-Upload-Command": "start",
+        "X-Goog-Upload-Header-Content-Length": str(file_size), "X-Goog-Upload-Header-Content-Type": mime_type,
     }
     payload = json.dumps({"file": {"display_name": display_name}})
     resp = make_request_with_retry("POST", url, headers=headers, data=payload)
@@ -164,10 +142,8 @@ def initiate_upload(api_key: str, display_name: str, mime_type: str, file_size: 
 def upload_bytes(upload_url: str, file_path: str, mime_type: str) -> Dict[str, Any]:
     file_size = os.path.getsize(file_path)
     headers = {
-        "Content-Type": mime_type or "application/octet-stream",
-        "Content-Length": str(file_size),
-        "X-Goog-Upload-Offset": "0",
-        "X-Goog-Upload-Command": "upload, finalize"
+        "Content-Type": mime_type or "application/octet-stream", "Content-Length": str(file_size),
+        "X-Goog-Upload-Offset": "0", "X-Goog-Upload-Command": "upload, finalize"
     }
     with open(file_path, "rb") as f:
         resp = requests.post(upload_url, headers=headers, data=f, timeout=300)
@@ -198,10 +174,8 @@ def wait_for_active(api_key: str, file_name: str, timeout_seconds: int = 60) -> 
             raise Exception("Timed out waiting for file to become ACTIVE.")
 
 def delete_file(api_key: str, file_name: str):
-    try:
-        requests.delete(f"{BASE_URL}/v1beta/{file_name}?key={api_key}", timeout=20)
-    except Exception:
-        pass
+    try: requests.delete(f"{BASE_URL}/v1beta/{file_name}?key={api_key}", timeout=20)
+    except Exception: pass
 
 
 # --- TRANSCRIPTION API CALL ---
@@ -219,8 +193,8 @@ def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str
         "safetySettings": safety_settings,
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192}
     }
-    
-    # NO RETRIES on content (Fail Fast)
+
+    # FAIL FAST: Only 1 attempt
     resp = make_request_with_retry("POST", api_url, json=payload, headers={"Content-Type": "application/json"})
     
     if resp.status_code != 200:
@@ -229,7 +203,7 @@ def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str
     try:
         body = resp.json()
     except ValueError:
-        return "PARSE ERROR: Non-JSON response."
+        return "PARSE ERROR"
 
     prompt_feedback = body.get("promptFeedback", {})
     if prompt_feedback and prompt_feedback.get("blockReason"):
@@ -242,8 +216,7 @@ def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str
         parts = content.get("parts", [])
         if parts:
             text = parts[0].get("text") or parts[0].get("content") or ""
-            if text.strip():
-                return text
+            if text.strip(): return text
 
     return "NO TRANSCRIPT (Empty Response)"
 
@@ -288,13 +261,14 @@ def process_single_row(index: int, row: pd.Series, api_key: str, final_prompt: s
         result.update({"status": "❌ Failed", "error": "Invalid URL"})
         return result
 
-    # SINGLE ATTEMPT (No retries loop)
+    # --- SINGLE ATTEMPT (FAIL FAST) ---
     tmp_path = None
     file_info = None
+
     try:
         parsed = urlparse(audio_url)
-        
-        # Download
+
+        # 1. Download
         logger.info("Downloading %s...", mobile)
         r = make_request_with_retry("GET", audio_url, stream=True)
         if r.status_code != 200: raise Exception(f"Download failed ({r.status_code})")
@@ -306,19 +280,20 @@ def process_single_row(index: int, row: pd.Series, api_key: str, final_prompt: s
                 if chunk: tmp.write(chunk)
             tmp_path = tmp.name
 
-        # Upload
         file_size = os.path.getsize(tmp_path)
+
+        # 2. Upload
         logger.info("Uploading %s...", mobile)
         cleaned_mobile = "".join(ch for ch in mobile if ch.isalnum())
         unique_name = f"rec_{cleaned_mobile}_{int(time.time())}_{random.randint(100,999)}{ext}"
         upload_url = initiate_upload(api_key, unique_name, mime_type, file_size)
         file_info = upload_bytes(upload_url, tmp_path, mime_type)
 
-        # Wait
+        # 3. Wait
         logger.info("Waiting for %s...", mobile)
         wait_for_active(api_key, file_info["name"])
 
-        # Transcribe
+        # 4. Transcribe
         logger.info("Transcribing %s...", mobile)
         transcript = generate_transcript(api_key, file_info["uri"], mime_type, final_prompt)
         result["transcript"] = transcript
@@ -346,11 +321,21 @@ def process_single_row(index: int, row: pd.Series, api_key: str, final_prompt: s
     return result
 
 
-# --- UI UTILS ---
+# --- RESULT MERGING ---
+
+def merge_results_with_original(df_consolidated: pd.DataFrame, processed_results: list) -> pd.DataFrame:
+    """
+    Merges the worker results back into the consolidated DataFrame.
+    """
+    results_df = pd.DataFrame(sorted(processed_results, key=lambda r: r["index"]))
+    cols_to_update = ["transcript", "status", "error"]
+    df_base = df_consolidated.drop(columns=[c for c in cols_to_update if c in df_consolidated.columns])
+    merged = df_base.merge(results_df[["index"] + cols_to_update], left_index=True, right_on="index", how="left")
+    if "index" in merged.columns: merged = merged.drop(columns=["index"])
+    return merged
 
 def colorize_transcript_html(text: str) -> str:
-    if not isinstance(text, str) or not text.strip():
-        return "<div class='other-speech'>No transcript</div>"
+    if not isinstance(text, str) or not text.strip(): return "<div class='other-speech'>No transcript</div>"
     lines = text.splitlines()
     html_output = ""
     for line in lines:
@@ -363,8 +348,8 @@ def colorize_transcript_html(text: str) -> str:
         else: html_output += f"<div class='other-speech'>{escaped_line}</div>"
     return f"<div>{html_output}</div>"
 
+# --- PROMPT ---
 DEFAULT_PROMPT_TEMPLATE = """Transcribe this call in {language} exactly as spoken.
-
 CRITICAL REQUIREMENTS — FOLLOW STRICTLY:
 1. EVERY line MUST start with exactly one of these labels:
    - Speaker 1:
@@ -387,12 +372,11 @@ LANGUAGE RULES:
 Return ONLY the transcript. No explanation.
 """
 
-# --- MAIN APP ---
+# --- MAIN ENTRY POINT ---
 
 def main():
-    # 1. Initialize Session State
-    if "final_df" not in st.session_state:
-        st.session_state.final_df = pd.DataFrame()
+    if "processed_results" not in st.session_state: st.session_state.processed_results = []
+    if "final_df" not in st.session_state: st.session_state.final_df = pd.DataFrame()
 
     with st.sidebar:
         st.header("Configuration")
@@ -406,153 +390,152 @@ def main():
             prompt_input = st.text_area("System Prompt", value=DEFAULT_PROMPT_TEMPLATE, height=300)
         st.divider()
         theme_choice = st.radio("Theme", ["Light", "Dark"], 0, horizontal=True)
-    
+
     theme_class = "dark-theme" if theme_choice == "Dark" else "light-theme"
     st.markdown(f"<div class='{theme_class}'>", unsafe_allow_html=True)
 
     st.write("### 📂 Upload Call Data")
     uploaded_files = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"], accept_multiple_files=True)
 
-    # Placeholders for progress
+    # Status Containers
     progress_bar = st.empty()
     status_text = st.empty()
-    result_placeholder = st.empty()
-
-    # --- LOGIC TO HANDLE "RESUME" vs "START" ---
     
-    # 1. Combine uploads first (needed for Resume check)
+    # LIVE TABLE PLACEHOLDER (New)
+    live_table_placeholder = st.empty()
+
+    # --- RESUME LOGIC SETUP ---
+    # 1. Combine Files
     raw_df = pd.DataFrame()
     if uploaded_files:
         dfs = []
-        for file in uploaded_files:
-            try: dfs.append(pd.read_excel(file))
+        for f in uploaded_files:
+            try: dfs.append(pd.read_excel(f))
             except: pass
-        if dfs:
-            raw_df = pd.concat(dfs, ignore_index=True)
+        if dfs: raw_df = pd.concat(dfs, ignore_index=True)
 
-    # 2. Check Session State for previous work
+    # 2. Check for Previous Work
     previous_df = st.session_state.final_df
-    rows_to_process = pd.DataFrame()
-    
-    col1, col2, col3 = st.columns([1,1,2])
     
     start_triggered = False
     resume_triggered = False
     clear_triggered = False
 
     if not raw_df.empty:
-        # Check intersection based on recording_url
+        # If we have a previous session with data, check what is pending
         if not previous_df.empty and 'recording_url' in previous_df.columns:
             processed_urls = set(previous_df['recording_url'].astype(str))
-            # Calculate pending
-            pending_df = raw_df[~raw_df['recording_url'].astype(str).isin(processed_urls)]
+            # Calculate pending based on URL
+            pending_df_check = raw_df[~raw_df['recording_url'].astype(str).isin(processed_urls)]
             
-            completed_count = len(raw_df) - len(pending_df)
+            completed_count = len(raw_df) - len(pending_df_check)
             
             if completed_count > 0:
                 st.info(f"Detected **{completed_count}** previously processed rows in memory.")
+                col1, col2 = st.columns([1, 1])
                 with col1:
-                    resume_triggered = st.button(f"▶️ Resume ({len(pending_df)} remaining)", type="primary")
+                    if len(pending_df_check) > 0:
+                        resume_triggered = st.button(f"▶️ Resume ({len(pending_df_check)} remaining)", type="primary")
+                    else:
+                        st.success("✅ All files processed!")
                 with col2:
                     clear_triggered = st.button("🗑️ Clear & Start Fresh")
             else:
-                with col1:
-                    start_triggered = st.button("🚀 Start Processing", type="primary")
+                start_triggered = st.button("🚀 Start Batch Processing", type="primary")
         else:
-            with col1:
-                start_triggered = st.button("🚀 Start Processing", type="primary")
+            start_triggered = st.button("🚀 Start Batch Processing", type="primary")
 
     if clear_triggered:
         st.session_state.final_df = pd.DataFrame()
+        st.session_state.processed_results = []
         st.rerun()
 
-    # --- PROCESSING BLOCK ---
+    # --- PROCESSING ---
     if start_triggered or resume_triggered:
-        if not api_key:
-            st.error("Please enter API Key.")
-            st.stop()
-
-        # Determine dataset
+        if not api_key: st.error("Please enter API Key."); st.stop()
+        
+        # Decide which dataset to use
         if resume_triggered:
+            # Filter for only pending rows
             processed_urls = set(previous_df['recording_url'].astype(str))
             df_input = raw_df[~raw_df['recording_url'].astype(str).isin(processed_urls)]
-            st.warning("Resuming... new results will be appended to existing data.")
+            # We want to keep the old processed results in the list
+            # st.session_state.processed_results is already populated
         else:
+            # Fresh start
             df_input = raw_df
-            st.session_state.final_df = pd.DataFrame() # Clear old if fresh start
+            st.session_state.processed_results = []
+            st.session_state.final_df = pd.DataFrame()
 
         # Prepare
         df_ready = prepare_all_rows(df_input)
-        
         final_prompt_to_use = prompt_input.replace("{language}", lang_map[language_mode])
         total_rows = len(df_ready)
+
+        status_text.info(f"Processing {total_rows} items with {max_workers} threads...")
+        progress_bar.progress(0.0)
         
-        if total_rows == 0:
-            st.success("All rows are already processed!")
-        else:
-            status_text.info(f"Processing {total_rows} items with {max_workers} threads...")
-            progress_bar.progress(0.0)
+        # Display the *existing* data immediately if resuming
+        if not st.session_state.final_df.empty:
+             live_table_placeholder.dataframe(st.session_state.final_df[["mobile_number", "status", "transcript"]], height=300, use_container_width=True)
 
-            results_buffer = []
-            
-            # Use ThreadPool
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {
-                    executor.submit(process_single_row, idx, row, api_key, final_prompt_to_use, keep_remote): idx
-                    for idx, row in df_ready.iterrows()
-                }
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(process_single_row, idx, row, api_key, final_prompt_to_use, keep_remote): idx
+                for idx, row in df_ready.iterrows()
+            }
 
-                completed = 0
-                for future in as_completed(futures):
-                    res = future.result()
-                    results_buffer.append(res)
-                    completed += 1
-                    
-                    # Update Progress
-                    progress_bar.progress(completed / total_rows)
-                    status_text.markdown(f"Processed **{completed}/{total_rows}** items.")
-                    
-                    # Live Preview
-                    preview_df = pd.DataFrame(results_buffer[-5:])
-                    if not preview_df.empty:
-                        result_placeholder.dataframe(
-                            preview_df[["mobile_number", "status", "transcript"]], 
-                            width=800, hide_index=True
-                        )
-
-                    # REAL-TIME SAVE TO GLOBAL STATE
-                    # We merge the NEW results buffer into a DataFrame
-                    new_results_df = pd.DataFrame(results_buffer)
-                    # We merge this with the original 'df_ready' to get the full columns (url, etc)
-                    # Note: We can't easily merge back to 'previous_df' inside the loop without getting slow.
-                    # Strategy: Store the *accumulated* list in session state temporarily?
-                    # Better: Just Append.
-                    
-            # FINAL MERGE after loop (or sub-merge)
-            # Create the DataFrame for just this run
-            run_results_df = pd.DataFrame(sorted(results_buffer, key=lambda r: r["index"]))
-            if not run_results_df.empty:
-                cols_to_update = ["transcript", "status", "error"]
-                df_base = df_ready.drop(columns=[c for c in cols_to_update if c in df_ready.columns])
-                merged_run_df = df_base.merge(run_results_df[["index"] + cols_to_update], left_index=True, right_on="index", how="left")
-                if "index" in merged_run_df.columns: merged_run_df = merged_run_df.drop(columns=["index"])
+            completed = 0
+            for future in as_completed(futures):
+                res = future.result()
                 
-                # Append to Session State
-                st.session_state.final_df = pd.concat([st.session_state.final_df, merged_run_df], ignore_index=True)
+                # Append to the GLOBAL results list
+                st.session_state.processed_results.append(res)
+                completed += 1
+                
+                # Update UI Progress
+                progress_bar.progress(completed / total_rows)
+                status_text.markdown(f"Processed **{completed}/{total_rows}** items.")
+                
+                # --- LIVE TABLE UPDATE ---
+                # 1. Merge the *current total list* of results with the original *raw_df*
+                # We need to merge with raw_df (not df_ready) to include the already finished ones if resuming
+                # But to keep it fast, we can just update the view based on 'processed_results' list
+                
+                # Create a temporary view DF from the results list
+                live_view_df = pd.DataFrame(st.session_state.processed_results)
+                # Sort it to keep it stable
+                if not live_view_df.empty:
+                    live_view_df = live_view_df.sort_values(by="index")
+                    
+                    # Update the placeholder
+                    live_table_placeholder.dataframe(
+                        live_view_df[["mobile_number", "status", "transcript", "error"]], 
+                        height=400,
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                
+                # Update the Session State Final DF (Background Save)
+                # Note: For Resume to work on next click, we need to map these back to the full structure
+                # We do this fully at the end, but we can do a partial update here if needed.
+                # For safety/speed, we update final_df at end of loop usually, but for "Stop" safety:
+                if not raw_df.empty and not live_view_df.empty:
+                     # This merge is slightly heavy but safer for "Stop" functionality
+                     st.session_state.final_df = merge_results_with_original(prepare_all_rows(raw_df), st.session_state.processed_results)
 
-            status_text.success("Batch Complete!")
-            time.sleep(1)
-            st.rerun() # Refresh to show full table
+        status_text.success("Batch Processing Complete!")
+        st.rerun()
 
-    # --- RESULTS VIEWER (ALWAYS VISIBLE IF DATA EXISTS) ---
+    # --- RESULTS VIEWER (ALWAYS VISIBLE) ---
     final_df = st.session_state.final_df
 
     if not final_df.empty:
         st.markdown("<hr/>", unsafe_allow_html=True)
-        st.markdown(f"## 🎛️ Transcript Browser ({len(final_df)} items)")
+        st.markdown("## 🎛️ Transcript Browser")
 
         col_a, col_b, col_c, col_d = st.columns([3, 1, 1, 1])
-        with col_a: search_q = st.text_input("Search", placeholder="Search text...")
+        with col_a: search_q = st.text_input("Search", placeholder="Search transcript, phone, or URL...")
         with col_b: status_sel = st.selectbox("Status", ["All", "Success", "Failed", "Skipped"])
         with col_c: speaker_sel = st.selectbox("Speaker", ["All", "Speaker 1", "Speaker 2"])
         with col_d: per_page = st.selectbox("Per page", [5, 10, 20, 50], index=1)
@@ -562,13 +545,11 @@ def main():
             if status_sel == "Success": view_df = view_df[view_df["status"].str.contains("Success", case=False, na=False)]
             elif status_sel == "Failed": view_df = view_df[view_df["status"].str.contains("Failed|Error|Empty", case=False, na=False)]
             elif status_sel == "Skipped": view_df = view_df[view_df["status"].str.contains("Skipped", case=False, na=False)]
-        
+
         if search_q.strip():
             q = search_q.lower()
-            mask = (
-                view_df["transcript"].fillna("").str.lower().str.contains(q) |
-                view_df["mobile_number"].astype(str).str.lower().str.contains(q)
-            )
+            mask = (view_df["transcript"].fillna("").str.lower().str.contains(q) | 
+                    view_df["mobile_number"].astype(str).str.lower().str.contains(q))
             view_df = view_df[mask]
 
         if speaker_sel != "All":
@@ -576,24 +557,30 @@ def main():
             mask = view_df["transcript"].fillna("").str.lower().str.contains(key)
             view_df = view_df[mask]
 
-        # Pagination & Download
         total_items = len(view_df)
-        st.caption(f"Showing {total_items} result(s)")
-        
+        st.markdown(f"**Showing {total_items} result(s)**")
+
+        # Download
         out_buf = BytesIO()
         view_df.to_excel(out_buf, index=False)
-        st.download_button("📥 Download Excel", data=out_buf.getvalue(), file_name="transcripts.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button("📥 Download Filtered Results", data=out_buf.getvalue(), file_name=f"transcripts_export_{int(time.time())}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+        # Pagination & Rendering
         pages = max(1, math.ceil(total_items / per_page))
-        page_idx = st.number_input("Page", 1, pages, 1)
+        page_idx = st.number_input("Page", min_value=1, max_value=pages, value=1, step=1)
         start = (page_idx - 1) * per_page
         page_df = view_df.iloc[start:start+per_page]
 
         for idx, row in page_df.iterrows():
-            with st.expander(f"{row.get('mobile_number')} — {row.get('status')}", expanded=False):
-                st.markdown(f"<div class='meta-row'><b>URL:</b> {row.get('recording_url')}</div>", unsafe_allow_html=True)
-                st.markdown(f"<div class='transcript-box'>{colorize_transcript_html(row.get('transcript'))}</div>", unsafe_allow_html=True)
-                if row.get("error"): st.error(row.get("error"))
+            mobile_display = row.get('mobile_number', 'Unknown')
+            status_display = row.get('status', '')
+            header = f"{mobile_display} — {status_display}"
+            with st.expander(header, expanded=False):
+                url_val = html.escape(str(row.get('recording_url', 'None')))
+                st.markdown(f"<div class='meta-row'><b>URL:</b> {url_val}</div>", unsafe_allow_html=True)
+                transcript_text = row.get("transcript", "")
+                st.markdown(f"<div class='transcript-box'>{colorize_transcript_html(transcript_text)}</div>", unsafe_allow_html=True)
+                if row.get("error"): st.error(f"Error: {row.get('error')}")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
