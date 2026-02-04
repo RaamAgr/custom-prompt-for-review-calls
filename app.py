@@ -7,6 +7,8 @@
 # 4. RESUME CAPABILITY: Automatically detects processed rows and lets you continue.
 # 5. LIVE TABLE VIEW: Shows the full results table updating in real-time.
 # 6. SAFE STOP: Use the browser "Stop" button; data is saved instantly.
+# 7. LONG CONTEXT FIX: Supports 65k tokens and stitches multi-part responses.
+# 8. NO DATA LOSS: Text file download added for transcripts > 32k chars.
 # -----------------------------------------------------------------------------
 
 import streamlit as st
@@ -21,6 +23,7 @@ import tempfile
 import random
 import math 
 import html
+import io
 from io import BytesIO
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -29,7 +32,7 @@ from typing import Optional, Dict, Any
 # --- CONFIGURATION ---
 BASE_URL = "https://generativelanguage.googleapis.com"
 UPLOAD_URL = "https://generativelanguage.googleapis.com/upload/v1beta/files"
-MODEL_NAME = "gemini-3-flash-preview"
+MODEL_NAME = "gemini-2.0-flash-exp" # Updated to latest flash or stick to "gemini-1.5-flash"
 
 # Streaming download chunk size (8KB)
 DOWNLOAD_CHUNK_SIZE = 8192
@@ -188,10 +191,12 @@ def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str
         {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
     ]
+    
+    # 1. INCREASED TOKEN LIMIT TO 65536
     payload = {
         "contents": [{"parts": [{"text": prompt}, {"file_data": {"mime_type": mime_type, "file_uri": file_uri}}]}],
         "safetySettings": safety_settings,
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192}
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 65536}
     }
 
     # FAIL FAST: Only 1 attempt
@@ -214,9 +219,24 @@ def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str
         first = candidates[0]
         content = first.get("content", {})
         parts = content.get("parts", [])
+        
+        # 2. FIXED: ITERATE THROUGH ALL PARTS TO STITCH FULL TRANSCRIPT
+        full_transcript_list = []
         if parts:
-            text = parts[0].get("text") or parts[0].get("content") or ""
-            if text.strip(): return text
+            for part in parts:
+                txt = part.get("text") or part.get("content") or ""
+                if txt:
+                    full_transcript_list.append(txt)
+        
+        full_text = "".join(full_transcript_list)
+
+        # 3. CHECK FOR TRUNCATION (finishReason)
+        finish_reason = first.get("finishReason")
+        if finish_reason == "MAX_TOKENS":
+            full_text += "\n\n[WARNING: TRANSCRIPT TRUNCATED BY TOKEN LIMIT]"
+
+        if full_text.strip(): 
+            return full_text
 
     return "NO TRANSCRIPT (Empty Response)"
 
@@ -517,12 +537,8 @@ def main():
                     )
                 
                 # Update the Session State Final DF (Background Save)
-                # Note: For Resume to work on next click, we need to map these back to the full structure
-                # We do this fully at the end, but we can do a partial update here if needed.
-                # For safety/speed, we update final_df at end of loop usually, but for "Stop" safety:
                 if not raw_df.empty and not live_view_df.empty:
-                     # This merge is slightly heavy but safer for "Stop" functionality
-                     st.session_state.final_df = merge_results_with_original(prepare_all_rows(raw_df), st.session_state.processed_results)
+                      st.session_state.final_df = merge_results_with_original(prepare_all_rows(raw_df), st.session_state.processed_results)
 
         status_text.success("Batch Processing Complete!")
         st.rerun()
@@ -560,10 +576,39 @@ def main():
         total_items = len(view_df)
         st.markdown(f"**Showing {total_items} result(s)**")
 
-        # Download
+        # --- DOWNLOADS ---
+        col_down1, col_down2 = st.columns(2)
+        
+        # 1. Excel Download
         out_buf = BytesIO()
         view_df.to_excel(out_buf, index=False)
-        st.download_button("📥 Download Filtered Results", data=out_buf.getvalue(), file_name=f"transcripts_export_{int(time.time())}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        with col_down1:
+            st.download_button(
+                "📥 Download Excel (Limit 32k chars/cell)", 
+                data=out_buf.getvalue(), 
+                file_name=f"transcripts_export_{int(time.time())}.xlsx", 
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+
+        # 2. Text Download (New Fix)
+        txt_buf = io.StringIO()
+        for idx, row in view_df.iterrows():
+            txt_buf.write(f"==================================================\n")
+            txt_buf.write(f"MOBILE: {row.get('mobile_number', 'N/A')}\n")
+            txt_buf.write(f"URL: {row.get('recording_url', 'N/A')}\n")
+            txt_buf.write(f"STATUS: {row.get('status', 'N/A')}\n")
+            txt_buf.write(f"==================================================\n\n")
+            txt_buf.write(f"{row.get('transcript', '')}\n\n")
+        
+        with col_down2:
+            st.download_button(
+                "📄 Download Text File (Full Data - No Limit)", 
+                data=txt_buf.getvalue(), 
+                file_name=f"transcripts_full_{int(time.time())}.txt", 
+                mime="text/plain",
+                use_container_width=True
+            )
 
         # Pagination & Rendering
         pages = max(1, math.ceil(total_items / per_page))
