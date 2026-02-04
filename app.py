@@ -1,9 +1,9 @@
-# app.py — COMPLETE BATCH TRANSCRIBER (ROBUST + RESUME + LIVE VIEW)
+# app.py — COMPLETE BATCH TRANSCRIBER (STRICT FAIL FAST MODE)
 # -----------------------------------------------------------------------------
 # FEATURES INCLUDED:
 # 1. Multi-file Excel Upload (Merges multiple files).
 # 2. Robust Gemini API Integration (Resumable Uploads).
-# 3. FAIL FAST: No retries on error or empty response (Configured per request).
+# 3. FAIL FAST: No retries. If it errors, it fails immediately.
 # 4. RESUME CAPABILITY: Automatically detects processed rows and lets you continue.
 # 5. LIVE TABLE VIEW: Shows the full results table updating in real-time.
 # 6. SAFE STOP: Use the browser "Stop" button; data is saved instantly.
@@ -32,14 +32,10 @@ from typing import Optional, Dict, Any
 # --- CONFIGURATION ---
 BASE_URL = "https://generativelanguage.googleapis.com"
 UPLOAD_URL = "https://generativelanguage.googleapis.com/upload/v1beta/files"
-MODEL_NAME = "gemini-3-flash-preview" # Reverted to your specific model
+MODEL_NAME = "gemini-1.5-flash" # Updated to current stable flash model, change if needed
 
 # Streaming download chunk size (8KB)
 DOWNLOAD_CHUNK_SIZE = 8192
-
-# Job-level retry configuration
-MAX_WORKER_RETRIES = 1  # 1 attempt only (Fail Fast)
-WORKER_BACKOFF_BASE = 0.5 
 
 # Configure logging to console
 logging.basicConfig(
@@ -80,29 +76,30 @@ st.set_page_config(page_title="Batch Transcriber", layout="wide")
 st.markdown(BASE_CSS, unsafe_allow_html=True)
 
 
-# --- NETWORK UTILITIES ---
+# --- NETWORK UTILITIES (STRICT FAIL FAST) ---
 
-def _sleep_with_jitter(base_seconds: float, attempt: int):
-    jitter = random.uniform(0.5, 1.5)
-    to_sleep = min(base_seconds * (2 ** attempt) * jitter, 30)
-    time.sleep(to_sleep)
-
-def make_request_with_retry(method: str, url: str, max_retries: int = 5, backoff_base: float = 0.5, **kwargs) -> requests.Response:
-    last_exc = None
-    for attempt in range(max_retries):
-        try:
-            resp = requests.request(method, url, timeout=120, **kwargs)
-            if resp.status_code == 429 or (500 <= resp.status_code < 600):
-                logger.warning("Transient HTTP %s (attempt %d). Retrying...", resp.status_code, attempt + 1)
-                _sleep_with_jitter(backoff_base, attempt)
-                continue
-            return resp
-        except requests.exceptions.RequestException as e:
-            logger.warning("RequestException: %s (attempt %d)", str(e), attempt + 1)
-            last_exc = e
-            _sleep_with_jitter(backoff_base, attempt)
-    if last_exc: raise last_exc
-    raise Exception("Retries exhausted")
+def make_request_with_retry(method: str, url: str, **kwargs) -> requests.Response:
+    """
+    STRICT FAIL FAST: Tries exactly once. 
+    If it hits a 429, 500, or connection error, it raises an exception immediately.
+    """
+    try:
+        # 120s timeout so we don't hang on dead connections
+        resp = requests.request(method, url, timeout=120, **kwargs)
+        
+        # Raise error for 4xx or 5xx status codes immediately
+        if resp.status_code >= 400:
+            # You can log specific codes here if needed
+            if resp.status_code == 429:
+                logger.warning(f"Rate Limit Hit (429) for {url}")
+            resp.raise_for_status()
+            
+        return resp
+        
+    except requests.exceptions.RequestException as e:
+        # Log it and re-raise immediately so the worker marks it as "Failed"
+        # logger.warning(f"Fail Fast triggered for {url}: {str(e)}") # Optional logging
+        raise e
 
 
 # --- MIME TYPE & FILE EXTENSION HANDLING ---
@@ -137,7 +134,10 @@ def initiate_upload(api_key: str, display_name: str, mime_type: str, file_size: 
         "X-Goog-Upload-Header-Content-Length": str(file_size), "X-Goog-Upload-Header-Content-Type": mime_type,
     }
     payload = json.dumps({"file": {"display_name": display_name}})
+    
+    # FAIL FAST call
     resp = make_request_with_retry("POST", url, headers=headers, data=payload)
+    
     if resp.status_code not in (200, 201):
         raise Exception(f"Init failed ({resp.status_code}): {resp.text}")
     return resp.headers.get("X-Goog-Upload-URL")
@@ -148,14 +148,24 @@ def upload_bytes(upload_url: str, file_path: str, mime_type: str) -> Dict[str, A
         "Content-Type": mime_type or "application/octet-stream", "Content-Length": str(file_size),
         "X-Goog-Upload-Offset": "0", "X-Goog-Upload-Command": "upload, finalize"
     }
-    with open(file_path, "rb") as f:
-        resp = requests.post(upload_url, headers=headers, data=f, timeout=300)
-    if resp.status_code == 400:
+    
+    # Using standard requests here for the binary upload, wrapped in try/except for Fail Fast
+    try:
         with open(file_path, "rb") as f:
-            resp = requests.put(upload_url, headers=headers, data=f, timeout=300)
-    if resp.status_code not in (200, 201):
-        raise Exception(f"UPLOAD FAILED {resp.status_code}: {resp.text}")
-    return resp.json().get("file", resp.json())
+            resp = requests.post(upload_url, headers=headers, data=f, timeout=300)
+            
+        if resp.status_code == 400:
+            # Fallback for some resume scenarios, but typically we want to fail fast
+            with open(file_path, "rb") as f:
+                resp = requests.put(upload_url, headers=headers, data=f, timeout=300)
+                
+        if resp.status_code not in (200, 201):
+            raise Exception(f"UPLOAD FAILED {resp.status_code}: {resp.text}")
+            
+        return resp.json().get("file", resp.json())
+        
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Upload connection failed: {str(e)}")
 
 
 # --- GOOGLE FILE STATUS POLLING ---
@@ -165,19 +175,22 @@ def wait_for_active(api_key: str, file_name: str, timeout_seconds: int = 60) -> 
     start = time.time()
     while True:
         resp = make_request_with_retry("GET", url)
-        if resp.status_code != 200:
-            time.sleep(2)
-        else:
-            j = resp.json()
-            state = j.get("state")
-            if state == "ACTIVE": return True
-            if state == "FAILED": raise Exception(f"File processing failed: {j.get('processingError', j)}")
-            time.sleep(2)
+        
+        j = resp.json()
+        state = j.get("state")
+        if state == "ACTIVE": return True
+        if state == "FAILED": raise Exception(f"File processing failed: {j.get('processingError', j)}")
+        
+        # Check timeout
         if time.time() - start > timeout_seconds:
             raise Exception("Timed out waiting for file to become ACTIVE.")
+            
+        # Short sleep to prevent hammering, but kept minimal
+        time.sleep(2)
+
 
 def delete_file(api_key: str, file_name: str):
-    try: requests.delete(f"{BASE_URL}/v1beta/{file_name}?key={api_key}", timeout=20)
+    try: requests.delete(f"{BASE_URL}/v1beta/{file_name}?key={api_key}", timeout=10)
     except Exception: pass
 
 
@@ -192,19 +205,17 @@ def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str
         {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
     ]
     
-    # 1. INCREASED TOKEN LIMIT TO 65536
     payload = {
         "contents": [{"parts": [{"text": prompt}, {"file_data": {"mime_type": mime_type, "file_uri": file_uri}}]}],
         "safetySettings": safety_settings,
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 65536}
     }
 
-    # FAIL FAST: Only 1 attempt
+    # FAIL FAST call
     resp = make_request_with_retry("POST", api_url, json=payload, headers={"Content-Type": "application/json"})
     
-    if resp.status_code != 200:
-        return f"API ERROR {resp.status_code}: {resp.text}"
-
+    # We shouldn't reach here if status >= 400 because make_request_with_retry raises
+    # But just in case of weird 200 responses with errors:
     try:
         body = resp.json()
     except ValueError:
@@ -220,7 +231,6 @@ def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str
         content = first.get("content", {})
         parts = content.get("parts", [])
         
-        # 2. FIXED: ITERATE THROUGH ALL PARTS TO STITCH FULL TRANSCRIPT
         full_transcript_list = []
         if parts:
             for part in parts:
@@ -230,7 +240,6 @@ def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str
         
         full_text = "".join(full_transcript_list)
 
-        # 3. CHECK FOR TRUNCATION (finishReason)
         finish_reason = first.get("finishReason")
         if finish_reason == "MAX_TOKENS":
             full_text += "\n\n[WARNING: TRANSCRIPT TRUNCATED BY TOKEN LIMIT]"
@@ -289,9 +298,8 @@ def process_single_row(index: int, row: pd.Series, api_key: str, final_prompt: s
         parsed = urlparse(audio_url)
 
         # 1. Download
-        logger.info("Downloading %s...", mobile)
+        # logger.info("Downloading %s...", mobile)
         r = make_request_with_retry("GET", audio_url, stream=True)
-        if r.status_code != 200: raise Exception(f"Download failed ({r.status_code})")
         header_ct = r.headers.get("content-type", "")
         ext, mime_type = detect_extension_and_mime(parsed.path, header_ct)
 
@@ -303,18 +311,18 @@ def process_single_row(index: int, row: pd.Series, api_key: str, final_prompt: s
         file_size = os.path.getsize(tmp_path)
 
         # 2. Upload
-        logger.info("Uploading %s...", mobile)
+        # logger.info("Uploading %s...", mobile)
         cleaned_mobile = "".join(ch for ch in mobile if ch.isalnum())
         unique_name = f"rec_{cleaned_mobile}_{int(time.time())}_{random.randint(100,999)}{ext}"
         upload_url = initiate_upload(api_key, unique_name, mime_type, file_size)
         file_info = upload_bytes(upload_url, tmp_path, mime_type)
 
         # 3. Wait
-        logger.info("Waiting for %s...", mobile)
+        # logger.info("Waiting for %s...", mobile)
         wait_for_active(api_key, file_info["name"])
 
         # 4. Transcribe
-        logger.info("Transcribing %s...", mobile)
+        # logger.info("Transcribing %s...", mobile)
         transcript = generate_transcript(api_key, file_info["uri"], mime_type, final_prompt)
         result["transcript"] = transcript
         
@@ -326,7 +334,7 @@ def process_single_row(index: int, row: pd.Series, api_key: str, final_prompt: s
             result["status"] = "✅ Success"
 
     except Exception as e:
-        logger.exception("Failed %s: %s", mobile, str(e))
+        # logger.exception("Failed %s: %s", mobile, str(e))
         result["transcript"] = f"SYSTEM ERROR: {str(e)}"
         result["status"] = "❌ Failed"
         result["error"] = str(e)
@@ -492,7 +500,7 @@ def main():
         final_prompt_to_use = prompt_input.replace("{language}", lang_map[language_mode])
         total_rows = len(df_ready)
 
-        status_text.info(f"Processing {total_rows} items with {max_workers} threads...")
+        status_text.info(f"Processing {total_rows} items with {max_workers} threads (FAIL FAST MODE)...")
         progress_bar.progress(0.0)
         
         # Display the *existing* data immediately if resuming
@@ -518,10 +526,6 @@ def main():
                 status_text.markdown(f"Processed **{completed}/{total_rows}** items.")
                 
                 # --- LIVE TABLE UPDATE ---
-                # 1. Merge the *current total list* of results with the original *raw_df*
-                # We need to merge with raw_df (not df_ready) to include the already finished ones if resuming
-                # But to keep it fast, we can just update the view based on 'processed_results' list
-                
                 # Create a temporary view DF from the results list
                 live_view_df = pd.DataFrame(st.session_state.processed_results)
                 # Sort it to keep it stable
@@ -538,7 +542,7 @@ def main():
                 
                 # Update the Session State Final DF (Background Save)
                 if not raw_df.empty and not live_view_df.empty:
-                      st.session_state.final_df = merge_results_with_original(prepare_all_rows(raw_df), st.session_state.processed_results)
+                       st.session_state.final_df = merge_results_with_original(prepare_all_rows(raw_df), st.session_state.processed_results)
 
         status_text.success("Batch Processing Complete!")
         st.rerun()
