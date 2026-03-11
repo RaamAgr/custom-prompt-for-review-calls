@@ -210,9 +210,9 @@ def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str
         "generationConfig": {
             "temperature": 0.7, 
             "maxOutputTokens": 65536,
-            "thinkingConfig": {
-                "thinkingLevel": "LOW"
-            }
+            # "thinkingConfig": {
+            #     "thinkingLevel": "LOW"
+            # }
         }
     }
 
