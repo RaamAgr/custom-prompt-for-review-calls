@@ -1,9 +1,9 @@
-# app.py — COMPLETE BATCH TRANSCRIBER (STRICT FAIL FAST MODE)
+# app.py — COMPLETE BATCH TRANSCRIBER (1-RETRY MODE)
 # -----------------------------------------------------------------------------
 # FEATURES INCLUDED:
 # 1. Multi-file Excel Upload (Merges multiple files).
 # 2. Robust Gemini API Integration (Resumable Uploads).
-# 3. FAIL FAST: No retries. If it errors, it fails immediately.
+# 3. ROBUST RETRY: Retries exactly once if download, upload, or transcription fails.
 # 4. RESUME CAPABILITY: Automatically detects processed rows and lets you continue.
 # 5. LIVE TABLE VIEW: Shows the full results table updating in real-time.
 # 6. SAFE STOP: Use the browser "Stop" button; data is saved instantly.
@@ -76,30 +76,32 @@ st.set_page_config(page_title="Batch Transcriber", layout="wide")
 st.markdown(BASE_CSS, unsafe_allow_html=True)
 
 
-# --- NETWORK UTILITIES (STRICT FAIL FAST) ---
+# --- NETWORK UTILITIES (1-RETRY ENABLED) ---
 
 def make_request_with_retry(method: str, url: str, **kwargs) -> requests.Response:
     """
-    STRICT FAIL FAST: Tries exactly once. 
-    If it hits a 429, 500, or connection error, it raises an exception immediately.
+    Attempts the request up to 2 times (1 retry) on connection errors or 429/50x status codes.
     """
-    try:
-        # 120s timeout so we don't hang on dead connections
-        resp = requests.request(method, url, timeout=120, **kwargs)
-        
-        # Raise error for 4xx or 5xx status codes immediately
-        if resp.status_code >= 400:
-            # You can log specific codes here if needed
-            if resp.status_code == 429:
-                logger.warning(f"Rate Limit Hit (429) for {url}")
-            resp.raise_for_status()
+    for attempt in range(2):
+        try:
+            # 120s timeout so we don't hang on dead connections
+            resp = requests.request(method, url, timeout=120, **kwargs)
             
-        return resp
-        
-    except requests.exceptions.RequestException as e:
-        # Log it and re-raise immediately so the worker marks it as "Failed"
-        # logger.warning(f"Fail Fast triggered for {url}: {str(e)}") # Optional logging
-        raise e
+            # Raise error for 4xx or 5xx status codes
+            if resp.status_code >= 400:
+                if resp.status_code in (429, 500, 502, 503, 504) and attempt == 0:
+                    logger.warning(f"Error {resp.status_code} for {url}. Retrying...")
+                    time.sleep(2)
+                    continue
+                resp.raise_for_status()
+                
+            return resp
+            
+        except requests.exceptions.RequestException as e:
+            if attempt == 0:
+                time.sleep(2)
+                continue
+            raise e
 
 
 # --- MIME TYPE & FILE EXTENSION HANDLING ---
@@ -135,7 +137,6 @@ def initiate_upload(api_key: str, display_name: str, mime_type: str, file_size: 
     }
     payload = json.dumps({"file": {"display_name": display_name}})
     
-    # FAIL FAST call
     resp = make_request_with_retry("POST", url, headers=headers, data=payload)
     
     if resp.status_code not in (200, 201):
@@ -149,13 +150,11 @@ def upload_bytes(upload_url: str, file_path: str, mime_type: str) -> Dict[str, A
         "X-Goog-Upload-Offset": "0", "X-Goog-Upload-Command": "upload, finalize"
     }
     
-    # Using standard requests here for the binary upload, wrapped in try/except for Fail Fast
     try:
         with open(file_path, "rb") as f:
             resp = requests.post(upload_url, headers=headers, data=f, timeout=300)
             
         if resp.status_code == 400:
-            # Fallback for some resume scenarios, but typically we want to fail fast
             with open(file_path, "rb") as f:
                 resp = requests.put(upload_url, headers=headers, data=f, timeout=300)
                 
@@ -217,11 +216,8 @@ def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str
         }
     }
 
-    # FAIL FAST call
     resp = make_request_with_retry("POST", api_url, json=payload, headers={"Content-Type": "application/json"})
     
-    # We shouldn't reach here if status >= 400 because make_request_with_retry raises
-    # But just in case of weird 200 responses with errors:
     try:
         body = resp.json()
     except ValueError:
@@ -300,61 +296,80 @@ def process_single_row(index: int, row: pd.Series, api_key: str, final_prompt: s
         result.update({"status": "❌ Failed", "error": "Invalid URL"})
         return result
 
-    # --- SINGLE ATTEMPT (FAIL FAST) ---
-    tmp_path = None
-    file_info = None
+    # --- PIPELINE RETRY LOGIC (MAX 2 ATTEMPTS) ---
+    for attempt in range(2):
+        tmp_path = None
+        file_info = None
 
-    try:
-        parsed = urlparse(audio_url)
+        try:
+            parsed = urlparse(audio_url)
 
-        # 1. Download
-        # logger.info("Downloading %s...", mobile)
-        r = make_request_with_retry("GET", audio_url, stream=True)
-        header_ct = r.headers.get("content-type", "")
-        ext, mime_type = detect_extension_and_mime(parsed.path, header_ct)
+            # 1. Download
+            r = make_request_with_retry("GET", audio_url, stream=True)
+            header_ct = r.headers.get("content-type", "")
+            ext, mime_type = detect_extension_and_mime(parsed.path, header_ct)
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-            for chunk in r.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
-                if chunk: tmp.write(chunk)
-            tmp_path = tmp.name
+            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                for chunk in r.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                    if chunk: tmp.write(chunk)
+                tmp_path = tmp.name
 
-        file_size = os.path.getsize(tmp_path)
+            file_size = os.path.getsize(tmp_path)
 
-        # 2. Upload
-        # logger.info("Uploading %s...", mobile)
-        cleaned_mobile = "".join(ch for ch in mobile if ch.isalnum())
-        unique_name = f"rec_{cleaned_mobile}_{int(time.time())}_{random.randint(100,999)}{ext}"
-        upload_url = initiate_upload(api_key, unique_name, mime_type, file_size)
-        file_info = upload_bytes(upload_url, tmp_path, mime_type)
+            # 2. Upload
+            cleaned_mobile = "".join(ch for ch in mobile if ch.isalnum())
+            unique_name = f"rec_{cleaned_mobile}_{int(time.time())}_{random.randint(100,999)}_{attempt}{ext}"
+            upload_url = initiate_upload(api_key, unique_name, mime_type, file_size)
+            file_info = upload_bytes(upload_url, tmp_path, mime_type)
 
-        # 3. Wait
-        # logger.info("Waiting for %s...", mobile)
-        wait_for_active(api_key, file_info["name"])
+            # 3. Wait
+            wait_for_active(api_key, file_info["name"])
 
-        # 4. Transcribe
-        # logger.info("Transcribing %s...", mobile)
-        transcript = generate_transcript(api_key, file_info["uri"], mime_type, final_prompt)
-        result["transcript"] = transcript
-        
-        if "API ERROR" in transcript or "BLOCKED" in transcript:
-            result["status"] = "❌ Error"
-        elif "NO TRANSCRIPT" in transcript:
-            result["status"] = "❌ Empty"
-        else:
-            result["status"] = "✅ Success"
+            # 4. Transcribe
+            transcript = generate_transcript(api_key, file_info["uri"], mime_type, final_prompt)
+            
+            # Check for logical API errors
+            if "API ERROR" in transcript or "BLOCKED" in transcript:
+                if attempt == 0:
+                    raise Exception(f"Logical API Error: {transcript}")
+                else:
+                    result["transcript"] = transcript
+                    result["status"] = "❌ Error"
+            elif "NO TRANSCRIPT" in transcript:
+                if attempt == 0:
+                    raise Exception("Empty transcript received.")
+                else:
+                    result["transcript"] = transcript
+                    result["status"] = "❌ Empty"
+            else:
+                result["transcript"] = transcript
+                result["status"] = "✅ Success"
+                result["error"] = None
+                
+            # If successful, break out of the retry loop entirely
+            if result["status"] == "✅ Success":
+                break
 
-    except Exception as e:
-        # logger.exception("Failed %s: %s", mobile, str(e))
-        result["transcript"] = f"SYSTEM ERROR: {str(e)}"
-        result["status"] = "❌ Failed"
-        result["error"] = str(e)
+        except Exception as e:
+            result["transcript"] = f"SYSTEM ERROR: {str(e)}"
+            result["status"] = "❌ Failed"
+            result["error"] = str(e)
+            
+            # Wait a moment before the second attempt
+            if attempt == 0:
+                time.sleep(2)
 
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try: os.remove(tmp_path)
-            except: pass
-        if file_info and isinstance(file_info, dict) and file_info.get("name") and not keep_remote:
-            delete_file(api_key, file_info["name"])
+        finally:
+            # Cleanup local temp file after EACH attempt
+            if tmp_path and os.path.exists(tmp_path):
+                try: os.remove(tmp_path)
+                except: pass
+                
+            # Cleanup remote file. Always delete if failed to prevent orphans.
+            # Only keep if user requested it AND it was a success.
+            should_keep = keep_remote and result["status"] == "✅ Success"
+            if file_info and isinstance(file_info, dict) and file_info.get("name") and not should_keep:
+                delete_file(api_key, file_info["name"])
 
     return result
 
@@ -510,7 +525,7 @@ def main():
         final_prompt_to_use = prompt_input.replace("{language}", lang_map[language_mode])
         total_rows = len(df_ready)
 
-        status_text.info(f"Processing {total_rows} items with {max_workers} threads (FAIL FAST MODE)...")
+        status_text.info(f"Processing {total_rows} items with {max_workers} threads (1 RETRY ALLOWED)...")
         progress_bar.progress(0.0)
         
         # Display the *existing* data immediately if resuming
