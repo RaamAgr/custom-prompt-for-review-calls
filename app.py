@@ -208,10 +208,10 @@ def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str
         "contents": [{"parts": [{"text": prompt}, {"file_data": {"mime_type": mime_type, "file_uri": file_uri}}]}],
         "safetySettings": safety_settings,
         "generationConfig": {
-            "temperature": 0.2, 
+            "temperature": 0.7, 
             "maxOutputTokens": 65536,
             "thinkingConfig": {
-                "thinkingLevel": "HIGH"
+                "thinkingLevel": "MEDIUM"
             }
         }
     }
