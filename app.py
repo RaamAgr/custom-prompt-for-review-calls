@@ -208,7 +208,13 @@ def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str
     payload = {
         "contents": [{"parts": [{"text": prompt}, {"file_data": {"mime_type": mime_type, "file_uri": file_uri}}]}],
         "safetySettings": safety_settings,
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 65536}
+        "generationConfig": {
+            "temperature": 0.2, 
+            "maxOutputTokens": 65536,
+            "thinkingConfig": {
+                "thinkingLevel": "HIGH"
+            }
+        }
     }
 
     # FAIL FAST call
@@ -234,6 +240,10 @@ def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str
         full_transcript_list = []
         if parts:
             for part in parts:
+                # Skip the model's internal thinking monologue
+                if part.get("thought"):
+                    continue
+                    
                 txt = part.get("text") or part.get("content") or ""
                 if txt:
                     full_transcript_list.append(txt)
